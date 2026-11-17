@@ -14,10 +14,10 @@ from typing import Optional
 
 from curl_cffi.requests import Session
 
-from .protocol import (
-    BROKER_CLIENT_ID, BROKER_REDIRECT_URI, CHAT_CLIENT_ID, CHAT_REDIRECT_URI,
-    CHAT_SCOPE, TOKEN_ORIGIN, TOKEN_URL,
+from .profile import (
+    current_profile, tenant_from_anchor, token_tenant_for,
 )
+from .protocol import CHAT_CLIENT_ID, CHAT_REDIRECT_URI, CHAT_SCOPE
 
 # All session state (browser profile + cached auth) lives under one folder.
 SESSION_DIR = "session"
@@ -28,13 +28,24 @@ AUTH_MAX_AGE = 7 * 60 * 60
 # Renew this long before the token's own expiry.
 _EXPIRY_MARGIN = 5 * 60
 
+# Personal accounts mint against `consumers`; work accounts against their own
+# tenant (see `token_tenant_for`).
+_TOKEN_URL = "https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token"
 
-def auth_from_token_response(body: dict, oid: str, anchor: str, stamp: float) -> dict:
-    """Build the ``token.json`` dict from an OAuth token-endpoint response."""
+
+def auth_from_token_response(body: dict, oid: str, anchor: str, stamp: float,
+                             tenant: Optional[str] = None) -> dict:
+    """Build the ``token.json`` dict from an OAuth token-endpoint response.
+
+    The account's tenant is kept alongside the ids: work/school accounts are
+    routed to their own tenant on the chat hub, while personal accounts go to the
+    MSA tenant. It is recovered from the sign-in anchor when not passed in.
+    """
     return {
         "access_token": body["access_token"],
         "refresh_token": body.get("refresh_token"),
         "oid": oid,
+        "tenant": tenant or tenant_from_anchor(anchor),
         "anchor": anchor,
         "expires_at": stamp + int(body.get("expires_in", 3600)),
         "saved_at": stamp,
@@ -48,13 +59,21 @@ def save_auth(auth: dict, path: str = DEFAULT_AUTH_FILE) -> dict:
     return auth
 
 
-def refresh_auth(auth: dict, proxy: Optional[str] = None) -> Optional[dict]:
-    """Renew the chat token over plain HTTP with the cached refresh token.
+def refresh_request(auth: dict) -> Optional[tuple]:
+    """The token-endpoint request that renews ``auth``: ``(url, data, headers)``.
 
-    Mirrors the request copilot.com's own MSAL broker makes. Returns the new
-    auth dict, or ``None`` if the refresh token is missing, expired or revoked.
+    Mirrors the request copilot.com's own MSAL broker makes. The endpoint's AAD
+    tenant follows the account (personal -> `consumers`, work -> the org tenant),
+    and ``Origin`` must be the site that minted the refresh token, since refresh
+    tokens are origin-bound.
+
+    Returns ``None`` when the account's tenant is unknown and the profile has no
+    default — a work account must refresh against its own tenant, so the caller
+    should re-mint the token in the browser instead of guessing.
     """
-    if not auth.get("refresh_token"):
+    profile = current_profile()
+    tenant = auth.get("tenant") or profile.default_tenant
+    if not tenant:
         return None
     data = {
         "client_id": CHAT_CLIENT_ID,
@@ -63,24 +82,42 @@ def refresh_auth(auth: dict, proxy: Optional[str] = None) -> Optional[dict]:
         "grant_type": "refresh_token",
         "refresh_token": auth["refresh_token"],
         "client_info": "1",
-        "brk_client_id": BROKER_CLIENT_ID,
-        "brk_redirect_uri": BROKER_REDIRECT_URI,
+        "brk_client_id": profile.broker_client_id,
+        "brk_redirect_uri": profile.broker_redirect_uri,
     }
     if auth.get("anchor"):
         data["X-AnchorMailbox"] = auth["anchor"]
+    url = _TOKEN_URL.format(tenant=token_tenant_for(tenant))
+    return url, data, {"Origin": profile.web_origin}
+
+
+def refresh_auth(auth: dict, proxy: Optional[str] = None) -> Optional[dict]:
+    """Renew the chat token over plain HTTP with the cached refresh token.
+
+    Returns the new auth dict, or ``None`` if the refresh token is missing,
+    expired, revoked, or blocked by a tenant policy (the caller then falls back
+    to re-minting it in the browser).
+    """
+    if not auth.get("refresh_token"):
+        return None
+    request = refresh_request(auth)
+    if request is None:
+        return None
+    url, data, headers = request
     try:
         with Session(impersonate="chrome", proxy=proxy, timeout=30) as session:
             response = session.post(
-                f"{TOKEN_URL}?brk_client_id={BROKER_CLIENT_ID}",
+                f"{url}?brk_client_id={data['brk_client_id']}",
                 data=data,
-                headers={"Origin": TOKEN_ORIGIN},
+                headers=headers,
             )
         body = response.json()
     except Exception:
         return None
     if response.status_code != 200 or "access_token" not in body:
         return None
-    renewed = auth_from_token_response(body, auth["oid"], auth.get("anchor"), time.time())
+    renewed = auth_from_token_response(body, auth["oid"], auth.get("anchor"),
+                                       time.time(), tenant=auth.get("tenant"))
     # Some responses omit a new refresh token; keep the old one then.
     renewed["refresh_token"] = renewed["refresh_token"] or auth["refresh_token"]
     return renewed
@@ -116,6 +153,10 @@ def load_auth(
             cached = json.loads(p.read_text(encoding="utf-8"))
         except (ValueError, OSError):
             cached = {}  # corrupt/unreadable -> refresh below
+        # Sessions saved by older versions carry no tenant; recover it from the
+        # sign-in anchor so work/school accounts route to their own tenant.
+        if cached and not cached.get("tenant"):
+            cached["tenant"] = tenant_from_anchor(cached.get("anchor"))
     now = time.time()
     if (not force and cached.get("access_token") and cached.get("oid")
             and now < cached.get("expires_at", 0) - _EXPIRY_MARGIN
@@ -142,7 +183,8 @@ def load_auth(
     if not auto_login:
         raise RuntimeError(
             "Not signed in (no Copilot token in the browser profile). "
-            "Run `python -m copilot login` and sign in first."
+            "Run `python -m copilot login` and sign in first"
+            " (for a work/school account also set COPILOT_PROFILE=enterprise)."
         )
 
     print("No saved Copilot session found — opening a browser to sign in...")

@@ -17,13 +17,17 @@ __version__ = '1.0.0'
 from .auth import load_auth
 from .browser import BrowserCopilot
 from .client import ChatReply, CopilotClient
-from .driver import ClearanceRequired, Copilot
+from .driver import ClearanceRequired, Copilot, LicenseRequired
+from .profile import Profile, current_profile
 
 __all__ = [
     'CopilotClient',
     'ChatReply',
     'Copilot',
     'ClearanceRequired',
+    'LicenseRequired',
     'BrowserCopilot',
     'load_auth',
+    'Profile',
+    'current_profile',
 ]

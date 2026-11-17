@@ -25,6 +25,7 @@ attach ``diagnostic_report.txt`` (not the raw capture).
 import argparse
 import io
 import json
+import os
 import platform
 import re
 import sys
@@ -43,7 +44,9 @@ LOGIN_LOG = SESSION_DIR / "login.log"
 WS_LOG = SESSION_DIR / "ws_capture.log"
 REPORT = SESSION_DIR / "diagnostic_report.txt"
 
-COPILOT_URL = "https://copilot.com/"
+# Point this at the site you are signed in to; work/school accounts live at
+# https://m365.cloud.microsoft/ (the hub path is the same either way).
+COPILOT_URL = os.environ.get("COPILOT_URL", "https://copilot.com/")
 CHAT_HINT = "/m365Copilot/Chathub/"  # the chat socket; other sockets are telemetry noise
 
 # Packages whose versions matter for reproducing chat/auth issues.
@@ -142,7 +145,6 @@ def session_section(r: Report) -> None:
         r.line("token.json  : MISSING (not signed in yet — run `python -m copilot login`)")
         return
 
-    import json
 
     try:
         data = json.loads(TOKEN_FILE.read_text(encoding="utf-8"))

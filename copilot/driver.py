@@ -12,16 +12,15 @@ import uuid
 from http.cookiejar import CookieJar
 from select import select
 from typing import Optional
-from urllib.parse import quote, urlencode
 
 from curl_cffi.const import CurlECode, CurlInfo
 from curl_cffi.curl import CurlError
 from curl_cffi.requests import CurlWsFlag, Session
 
 from .models import AbstractProvider, Conversation, ImageType
+from .profile import current_profile
 from .protocol import (
-    CHATHUB_URL, HANDSHAKE, HUB_PARAMS, MSA_TENANT, PING, VARIANTS,
-    TurnParser, chat_frame, encode, split_records,
+    HANDSHAKE, PING, TurnParser, build_hub_url, chat_frame, encode, split_records,
 )
 
 # curl_cffi's WebSocket.recv() loops on CURLE_AGAIN forever (select() then retry)
@@ -41,6 +40,16 @@ class ClearanceRequired(RuntimeError):
 
 class AuthExpired(RuntimeError):
     """The chat socket rejected the access token (expired or revoked)."""
+
+
+class LicenseRequired(RuntimeError):
+    """The account has no Copilot licence/seat for the requested experience.
+
+    Consumer accounts see this only if the free tier is unavailable; work/school
+    accounts see it when the user has no Microsoft 365 Copilot licence (or an
+    administrator turned Copilot off for them). Nothing can be fixed client-side:
+    the tenant must assign a licence.
+    """
 
 
 class Copilot(AbstractProvider):
@@ -63,7 +72,7 @@ class Copilot(AbstractProvider):
             return_conversation: bool = False,
             access_token: str = None,
             oid: str = None,
-            tenant: str = MSA_TENANT,
+            tenant: Optional[str] = None,
             **kwargs
         ):
         """Stream a Copilot reply to ``prompt``.
@@ -73,6 +82,11 @@ class Copilot(AbstractProvider):
         ``chat`` invocation and yields reply text as it streams. ``prompt`` is
         sent as one user message (the protocol has no separate system/role
         channel).
+
+        ``tenant`` is the account's AAD tenant, which routes the hub (consumer
+        accounts -> MSA tenant, work/school accounts -> the organisation's). It
+        defaults to the one captured at sign-in by :class:`copilot.CopilotClient`,
+        and otherwise to the active profile's default.
 
         Conversation targeting (first match wins):
           * ``conversation`` — reuse an existing :class:`Conversation` object;
@@ -88,6 +102,13 @@ class Copilot(AbstractProvider):
         if not access_token or not oid:
             raise ValueError("A signed-in access_token and account oid are required "
                              "(see copilot.auth.load_auth).")
+        tenant = tenant or current_profile().default_tenant
+        if not tenant:
+            raise ValueError(
+                "No hub tenant for this profile. Sign in with the work account so "
+                "the tenant is captured (`python -m copilot login`), or set "
+                "COPILOT_TENANT=<tenant-id>."
+            )
 
         start_of_session = conversation_id is None
         if start_of_session:
@@ -97,26 +118,28 @@ class Copilot(AbstractProvider):
 
         request_id = str(uuid.uuid4())
         session_id = str(uuid.uuid4())
-        query = {
-            "chatsessionid": request_id,
-            "XRoutingParameterSessionKey": oid,
-            "clientrequestid": request_id,
-            "X-SessionId": session_id,
-            "ConversationId": conversation_id,
-            "access_token": access_token,
-            "variants": VARIANTS,
-            **HUB_PARAMS,
-        }
-        websocket_url = (CHATHUB_URL.format(oid=oid, tenant=tenant) + "?"
-                         + urlencode(query, quote_via=quote, safe=","))
+        websocket_url = build_hub_url(
+            oid=oid,
+            tenant=tenant,
+            conversation_id=conversation_id,
+            request_id=request_id,
+            session_id=session_id,
+            access_token=access_token,
+        )
 
         with Session(timeout=timeout, proxy=proxy, impersonate="chrome",
-                     headers={"Origin": "https://copilot.com"}) as session:
+                     headers={"Origin": current_profile().web_origin}) as session:
             try:
                 wss = session.ws_connect(websocket_url)
             except CurlError as exc:
-                if "401" in str(exc) or "403" in str(exc):
+                if "401" in str(exc):
                     raise AuthExpired(f"Copilot rejected the access token: {exc}") from exc
+                if "403" in str(exc):
+                    raise AuthExpired(
+                        "Copilot refused the connection (403): the token may be "
+                        "rejected, or the account/tenant isn't licensed for this "
+                        f"experience. {exc}"
+                    ) from exc
                 raise
             wss.send(HANDSHAKE, CurlWsFlag.TEXT)
             wss.send(PING, CurlWsFlag.TEXT)
@@ -165,7 +188,15 @@ class Copilot(AbstractProvider):
         lowered = message.lower()
         if any(word in lowered for word in ("challenge", "captcha", "turnstile")):
             raise ClearanceRequired(f"Copilot asked for human verification: {message}")
-        if any(word in lowered for word in ("unauthorized", "token", "authentication")):
+        if any(word in lowered for word in
+               ("license", "licence", "entitle", "no seat", "subscription required",
+                "upgrade your plan", "not authorized to use")):
+            raise LicenseRequired(
+                f"Copilot says this account isn't licensed for chat: {message}"
+            )
+        if any(word in lowered for word in
+               ("unauthorized", "token", "authentication", "aadsts",
+                "invalid_grant", "tenant")):
             raise AuthExpired(f"Copilot rejected the access token: {message}")
         raise RuntimeError(f"Copilot error: {message}")
 

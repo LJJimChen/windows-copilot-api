@@ -7,7 +7,7 @@ from fastapi import FastAPI
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from copilot import CopilotClient
-from copilot.driver import ClearanceRequired
+from copilot.driver import ClearanceRequired, LicenseRequired
 
 from .config import MODEL_NAME, RATE_LIMIT_BURST, RATE_LIMIT_RPM
 from .openai_format import (
@@ -29,6 +29,13 @@ client = CopilotClient(interactive_clear=False)
 _CLEARANCE_HELP = (
     "Copilot asked for human verification before answering. Open copilot.com in "
     "your browser, pass the check, then retry (or run `python -m copilot login`)."
+)
+
+_LICENSE_HELP = (
+    "This account isn't licensed for Copilot chat. Personal accounts use the free "
+    "tier; work/school accounts need a Microsoft 365 Copilot licence, and the "
+    "tenant may have turned Copilot off. If this is a work account, also make sure "
+    "the server runs with COPILOT_PROFILE=enterprise."
 )
 
 # Self-imposed rate limit on top of the concurrency lock below: this caps
@@ -90,6 +97,10 @@ def _stream(prompt: str, model: str, conversation_id=None):
         yield sse_event(
             stream_chunk(cid, created, model, {"content": f"\n[error: {_CLEARANCE_HELP}]"}, finish="error")
         )
+    except LicenseRequired:
+        yield sse_event(
+            stream_chunk(cid, created, model, {"content": f"\n[error: {_LICENSE_HELP}]"}, finish="error")
+        )
     except Exception as exc:  # surface errors to the client instead of hanging
         yield sse_event(
             stream_chunk(cid, created, model, {"content": f"\n[error: {exc}]"}, finish="error")
@@ -135,6 +146,11 @@ def chat_completions(req: ChatCompletionRequest):
         return JSONResponse(
             status_code=503,
             content={"error": {"message": _CLEARANCE_HELP, "type": "clearance_required"}},
+        )
+    except LicenseRequired as exc:
+        return JSONResponse(
+            status_code=403,
+            content={"error": {"message": f"{_LICENSE_HELP} ({exc})", "type": "license_required"}},
         )
     except Exception as exc:
         return JSONResponse(

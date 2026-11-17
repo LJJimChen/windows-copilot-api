@@ -24,15 +24,34 @@ import json
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import List, Optional
+from typing import Optional
 from urllib.parse import parse_qs, urlparse
 
 from playwright.sync_api import Error as PlaywrightError, sync_playwright
 
 from .auth import DEFAULT_AUTH_FILE, DEFAULT_PROFILE_DIR, auth_from_token_response, save_auth
+from .profile import current_profile, login_hosts
 
+# Kept for backwards compatibility; the active profile's ``chat_url`` is used.
 NEW_CHAT_URL = "https://copilot.com/chat"
 _LOGIN_HOSTS = ("login.microsoftonline.com", "login.live.com")
+# Work/school tenants sign in against their own AAD instance or a federated IdP.
+_LOGIN_HOST_SUFFIXES = (".microsoftonline.com", ".microsoftonline.us", ".live.com")
+
+
+def _is_login_host(host: str) -> bool:
+    """True if ``host`` is a Microsoft/federated sign-in page.
+
+    Custom IdPs (ADFS, Okta, ...) can't be enumerated; list them with
+    ``COPILOT_LOGIN_HOSTS=adfs.example.com,idp.example.com``.
+    """
+    host = (host or "").lower()
+    if not host:
+        return False
+    if host in _LOGIN_HOSTS or host.endswith(_LOGIN_HOST_SUFFIXES):
+        return True
+    return any(host == extra or host.endswith("." + extra) for extra in login_hosts())
+
 
 # copilot.com's own session cookie (OH.SID) — and Microsoft's sign-in cookies,
 # unless "Stay signed in" was chosen — are session cookies, which Chromium drops
@@ -83,6 +102,9 @@ class BrowserCopilot:
         self.profile_dir = str(Path(profile_dir).resolve())
         self.headless = headless
         self.nav_timeout = nav_timeout
+        # Where to sign in / capture the token: copilot.com for personal
+        # accounts, m365.cloud.microsoft for work/school ones (see profile.py).
+        self.chat_url = current_profile().chat_url
         # Route the browser through a proxy if needed, e.g.
         # proxy="http://user:pass@host:port" or "socks5://host:port".
         self.proxy = proxy
@@ -196,9 +218,11 @@ class BrowserCopilot:
 
     def _on_login_page(self) -> bool:
         u = urlparse(self._page.url)
-        if u.hostname in _LOGIN_HOSTS:
+        if _is_login_host(u.hostname or ""):
             return True
-        return (u.hostname or "").endswith("copilot.com") and u.path.startswith("/login")
+        # Work accounts may bounce through the M365 shell before AAD; both sites
+        # expose /login while a sign-in is in progress.
+        return u.path.startswith("/login")
 
     def _window_closed(self) -> bool:
         try:
@@ -246,7 +270,7 @@ class BrowserCopilot:
         self.start()
         self._captured = None
         try:
-            self._page.goto(NEW_CHAT_URL, wait_until="domcontentloaded")
+            self._page.goto(self.chat_url, wait_until="domcontentloaded")
         except PlaywrightError:
             return None
         return self._await_token(timeout, give_up_on_login=True)
@@ -265,18 +289,19 @@ class BrowserCopilot:
         self._captured = None
 
         log = self._open_login_log(Path(path).resolve().parent / "login.log")
-        log(f"login started; browser open at {NEW_CHAT_URL}")
+        log(f"login started; browser open at {self.chat_url}")
         self._mirror_page_events(log)
 
         print(
-            "\nA browser window is open at copilot.com.\n"
-            "Sign in with your Microsoft account, and choose 'Yes' if asked to stay signed in.\n"
+            f"\nA browser window is open at {self.chat_url}.\n"
+            "Sign in with your Microsoft or work/school account, and choose 'Yes' if asked\n"
+            "to stay signed in.\n"
             "It finishes by itself once sign-in is detected — no need to press Enter.\n"
         )
 
         auth: dict = {}
         try:
-            self._page.goto(NEW_CHAT_URL, wait_until="domcontentloaded")
+            self._page.goto(self.chat_url, wait_until="domcontentloaded")
             captured = self._await_token(timeout, give_up_on_login=False)
         except PlaywrightError as exc:
             log(f"login error: {exc}")

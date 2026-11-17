@@ -26,6 +26,7 @@ You sign in once in a browser with your Microsoft **or Google** account; your se
 - [Usage 1: In Python (no server)](#usage-1-in-python-no-server)
 - [Usage 2: As an OpenAI-compatible server](#usage-2-as-an-openai-compatible-server)
 - [Command line](#command-line)
+- [Enterprise accounts (Microsoft 365 Copilot)](#enterprise-accounts-microsoft-365-copilot)
 - [Concurrency & stress test](#concurrency--stress-test)
 - [Rate limiting](#rate-limiting)
 - [Project layout](#project-layout)
@@ -110,7 +111,7 @@ docker compose up --build
 # -> Copilot OpenAI-compatible API on http://localhost:8000
 ```
 
-The [docker-compose.yml](docker-compose.yml) maps port `8000` and bind-mounts your `session/` so the login persists across restarts. Tune `RATE_LIMIT_RPM` / `RATE_LIMIT_BURST` there. To run without Compose, build and pass the same bindings by hand:
+The [docker-compose.yml](docker-compose.yml) maps port `8000` and bind-mounts your `session/` so the login persists across restarts. Tune `RATE_LIMIT_RPM` / `RATE_LIMIT_BURST` there, and uncomment `COPILOT_PROFILE` for a work/school account. To run without Compose, build and pass the same bindings by hand:
 
 ```bash
 docker build -t windows-copilot-api .
@@ -196,7 +197,12 @@ curl http://localhost:8000/v1/chat/completions \
 ```bash
 python -m copilot login          # sign in and save the session
 python -m copilot ask "Hello!"   # quick one-shot question
+python -m copilot doctor         # profile + session report, then one probe turn
 ```
+
+`doctor` never opens a window: it reads the saved session, prints the active
+profile, tenant and token expiry, then sends a single message and reports what
+failed (sign-in, licence, verification) if anything did.
 
 ---
 
@@ -215,6 +221,93 @@ authenticated with your signed-in chat token:
   signed-in browser profile, headlessly; if that profile is signed out, run
   `python -m copilot login` again. The **server** never opens a window: it
   returns an error telling you to sign in.
+
+---
+
+## Enterprise accounts (Microsoft 365 Copilot)
+
+The same backend serves personal accounts (`copilot.com`) and work/school
+accounts (`m365.cloud.microsoft`); only the tenant and the routing parameters
+differ. Select the licensed front-end with one environment variable:
+
+```bash
+COPILOT_PROFILE=enterprise python -m copilot login   # sign in with the work account
+COPILOT_PROFILE=enterprise python app.py             # serve it
+```
+
+The account's AAD tenant is captured at sign-in and used from then on — for the
+chat socket and for token refresh — so nothing else has to be configured. Check
+the whole chain with one command:
+
+```bash
+COPILOT_PROFILE=enterprise python -m copilot doctor
+```
+
+It prints the profile, the effective hub parameters, the account's tenant and
+token expiry, then sends a single probe turn. A missing licence, an expired
+token and a verification challenge are reported separately, each with the next
+step.
+
+**What the profile changes** (all overridable, in case Microsoft moves a value):
+
+| Env var | Default (consumer) | Enterprise preset |
+| --- | --- | --- |
+| `COPILOT_PROFILE` | `consumer` | `enterprise` |
+| `COPILOT_CHAT_URL` | `https://copilot.com/chat` | `https://m365.cloud.microsoft/chat` |
+| `COPILOT_WEB_ORIGIN` | `https://copilot.com` | `https://m365.cloud.microsoft` |
+| `COPILOT_LICENSE_TYPE` | `Free` | `Copilot` |
+| `COPILOT_SCENARIO` | `OfficeWebFreeConsumerCopilot` | `OfficeWebCopilot` |
+| `COPILOT_TENANT` | MSA tenant | the signed-in account's tenant |
+| `COPILOT_SOURCE` / `_PRODUCT` / `_AGENT_HOST` / `_AGENT` / `_IS_EDU` | same on both | same on both |
+| `COPILOT_CLIENT_PLATFORM` / `_CLIENT_ENTRYPOINT` | `copilotcom-web` / `copilotcom-officeweb` | same on both |
+| `COPILOT_BROKER_CLIENT_ID` / `_BROKER_REDIRECT_URI` | copilot.com's MSAL broker | same on both |
+| `COPILOT_LOGIN_HOSTS` | — | extra sign-in hosts (ADFS, Okta, …) |
+
+Things to know before relying on it:
+
+- **A licence is required.** Microsoft 365 Copilot is a paid per-user add-on; a
+  tenant without it answers with a licence error, which the API surfaces as
+  `403 license_required` instead of a generic `502`.
+- **Conditional Access can shorten the session.** MFA, sign-in-frequency and
+  compliant-device policies may stop the headless re-mint from working, so plan
+  on `python -m copilot login` more often. The server still never opens a window.
+- **Unverified fields.** `licenseType`/`scenario` (and the two `clientInfo`
+  branding fields) were the only values that could not be derived from the
+  consumer capture. Capture them from your own tenant with the script below, or
+  set them by hand.
+- Please keep the rate limit sane: a work account is tied to a tenant, and
+  administrators can see usage.
+
+### Capturing the licensed values
+
+The preset was inferred; your tenant is the ground truth. One command records
+what the real web client sends, then prints the overrides to apply:
+
+```bash
+COPILOT_PROFILE=enterprise python -m copilot login     # once, if not already
+COPILOT_PROFILE=enterprise python tests/capture_enterprise.py
+```
+
+It opens `https://m365.cloud.microsoft/chat`, waits for you to send **one short
+message**, and writes `session/enterprise_profile.json`. The file contains the
+hub's routing parameters, `clientInfo`, the shape of the chat frame, which
+response records the turn produced, and which AAD tenant the token endpoint was
+addressed to. It contains **no tokens, no cookies, no message text and no
+account id** — a test asserts the redaction — so it is safe to attach to an
+issue. If the captured values differ from the preset, the script prints the
+matching `COPILOT_*` exports.
+
+Prefer doing it by hand? Open the site signed in, then DevTools → Network → WS:
+
+1. click the `Chathub` connection and copy its **URL** (carries `licenseType`,
+   `scenario`, `agentHost`, `source`, `variants`);
+2. send a message and copy the first **sent** frame (JSON with
+   `"target": "chat"`; `clientInfo` is inside `arguments[0]`);
+3. for the `/oauth2/v2.0/token` request, note the **tenant segment in the path**,
+   the `Origin` header, and the form values `client_id` / `brk_client_id` /
+   `redirect_uri` / `brk_redirect_uri`.
+
+Redact `access_token`, `refresh_token` and `code` before sharing anything.
 
 ---
 
@@ -296,10 +389,10 @@ add a few retries yourself.
 
 | Path | What it does |
 | --- | --- |
-| [copilot/](copilot/) | The core library: `CopilotClient`, auth + token refresh, browser sign-in, HTTP driver, protocol |
+| [copilot/](copilot/) | The core library: `CopilotClient`, auth + token refresh, browser sign-in, HTTP driver, protocol, and the consumer/enterprise profiles ([copilot/profile.py](copilot/profile.py)) |
 | [server/](server/) | The FastAPI OpenAI-compatible server |
 | [examples/](examples/) | Runnable examples for every feature ([examples/README.md](examples/README.md)) |
-| [tests/](tests/) | Test scripts: the concurrency stress test ([tests/stress.py](tests/stress.py)) and the diagnostic & report tool ([tests/diagnostic.py](tests/diagnostic.py)) |
+| [tests/](tests/) | Test scripts: the concurrency stress test ([tests/stress.py](tests/stress.py)), the diagnostic & report tool ([tests/diagnostic.py](tests/diagnostic.py)), the enterprise capture helper ([tests/capture_enterprise.py](tests/capture_enterprise.py)), and the unit tests |
 | [app.py](app.py) | Starts the server |
 
 ---

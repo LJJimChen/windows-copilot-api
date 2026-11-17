@@ -19,28 +19,43 @@ The conversation id is chosen by the client (a fresh UUID); continuing a
 conversation just reuses it. Captured from a live copilot.com session with
 ``tests/diagnostic.py`` (``session/ws_capture.log``); when Microsoft changes the
 protocol, recapture it and update this file.
+
+The same hub serves consumer and Microsoft 365 (work/school) accounts; only the
+tenant in the URL and the routing parameters differ, and both come from
+:mod:`copilot.profile`.
 """
 
 import json
+import os
 import time
 from datetime import datetime
 from typing import List, Optional, Union
+from urllib.parse import quote, urlencode
+
+# Re-exported so existing imports (`from copilot.protocol import MSA_TENANT`)
+# keep working; the constants themselves now live with the profiles.
+from .profile import BROKER_CLIENT_ID, BROKER_REDIRECT_URI, MSA_TENANT
+
+__all__ = [
+    "BROKER_CLIENT_ID", "BROKER_REDIRECT_URI", "MSA_TENANT",
+    "CHATHUB_URL", "RECORD_SEPARATOR", "CHAT_CLIENT_ID", "CHAT_REDIRECT_URI",
+    "CHAT_SCOPE", "HUB_PARAMS", "VARIANTS", "OPTIONS_SETS", "ALLOWED_MESSAGE_TYPES",
+    "chat_frame", "build_hub_url", "encode", "split_records", "TurnParser",
+    "HANDSHAKE", "PING",
+]
 
 CHATHUB_URL = "wss://substrate.office.com/m365Copilot/Chathub/{oid}@{tenant}"
-# Consumer (Microsoft account) users are routed through the MSA tenant.
-MSA_TENANT = "84df9e7f-e9f6-40af-b435-aaaaaaaaaaaa"
 RECORD_SEPARATOR = "\x1e"
 
 # --- auth: the chat token is minted through copilot.com's MSAL broker ---------
-TOKEN_URL = "https://login.microsoftonline.com/9188040d-6c67-4c5b-b112-36a304b66dad/oauth2/v2.0/token"
+# The token *endpoint* is assembled per account in :mod:`copilot.auth` (personal
+# accounts use the `consumers` tenant, work accounts their own), and the refresh
+# `Origin` / broker ids come from :mod:`copilot.profile`.
 CHAT_CLIENT_ID = "c0ab8ce9-e9a0-42e7-b064-33d422df41f1"
 CHAT_REDIRECT_URI = "brk-multihub://outlook.office.com"
-BROKER_CLIENT_ID = "4765445b-32c6-49b0-83e6-1d93765276ca"
-BROKER_REDIRECT_URI = "https://copilot.com/spalanding"
 CHAT_SCOPE = "https://substrate.office.com/sydney/v2/.default openid profile offline_access"
-TOKEN_ORIGIN = "https://copilot.com"  # SPA refresh tokens are only redeemable cross-origin
 
-# --- chat socket query string (besides the per-turn ids and token) ------------
+# --- chat socket query string (consumer defaults; profiles override) ----------
 HUB_PARAMS = {
     "source": '"officeweb"',
     "product": "Office",
@@ -105,10 +120,12 @@ ALLOWED_MESSAGE_TYPES = [
 
 
 def _client_info(session_id: str) -> dict:
+    # Both front-ends share the Office web shell; the two branding fields are
+    # overridable in case the licensed client reports different ones.
     return {
-        "clientPlatform": "copilotcom-web",
+        "clientPlatform": os.environ.get("COPILOT_CLIENT_PLATFORM", "copilotcom-web"),
         "clientAppName": "Office",
-        "clientEntrypoint": "copilotcom-officeweb",
+        "clientEntrypoint": os.environ.get("COPILOT_CLIENT_ENTRYPOINT", "copilotcom-officeweb"),
         "clientSessionId": session_id,
         "ProductCategory": "Chat",
         "clientAppType": "Web",
@@ -177,6 +194,39 @@ def chat_frame(text: str, request_id: str, session_id: str, start_of_session: bo
 def encode(record: dict) -> bytes:
     """Serialise one SignalR record (JSON + record separator)."""
     return (json.dumps(record) + RECORD_SEPARATOR).encode()
+
+
+def build_hub_url(
+    oid: str,
+    tenant: str,
+    conversation_id: str,
+    request_id: str,
+    session_id: str,
+    access_token: str,
+    profile=None,
+) -> str:
+    """The chat socket URL for one turn (auth + routing + feature flags).
+
+    ``profile`` defaults to :func:`copilot.profile.current_profile`; its
+    ``hub_params`` select the consumer or the licensed experience. The URL is
+    built here rather than in the driver so both transports (and tests) share it.
+    """
+    if profile is None:
+        from .profile import current_profile
+
+        profile = current_profile()
+    query = {
+        "chatsessionid": request_id,
+        "XRoutingParameterSessionKey": oid,
+        "clientrequestid": request_id,
+        "X-SessionId": session_id,
+        "ConversationId": conversation_id,
+        "access_token": access_token,
+        "variants": VARIANTS,
+        **profile.hub_params,
+    }
+    return (CHATHUB_URL.format(oid=oid, tenant=tenant) + "?"
+            + urlencode(query, quote_via=quote, safe=","))
 
 
 HANDSHAKE = encode({"protocol": "json", "version": 1})

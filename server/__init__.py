@@ -47,7 +47,11 @@ def app(host=None, port=None) -> None:
     except Exception as exc:
         print(f"Warning: could not establish a Copilot session: {exc}")
 
+    from copilot.profile import current_profile
+
+    profile = current_profile()
     print(f"Copilot OpenAI-compatible API on http://{host}:{port}  (POST /v1/chat/completions)")
+    print(f"Profile: {profile.name} ({profile.web_origin})")
     uvicorn.run(_api, host=host, port=port)
 
 

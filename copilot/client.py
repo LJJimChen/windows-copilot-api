@@ -20,6 +20,10 @@ is the incremental variant.
 The signed-in access token is refreshed transparently over HTTP; sign in once
 with ``python -m copilot login``. Pass ``proxy=...`` to route requests through a
 proxy.
+
+Both consumer (copilot.com) and Microsoft 365 (work/school) accounts are
+supported; pick the enterprise profile with ``COPILOT_PROFILE=enterprise``. See
+:mod:`copilot.profile`.
 """
 
 import sys
@@ -138,6 +142,7 @@ class CopilotClient:
                 proxy=self._proxy,
                 access_token=auth["access_token"],
                 oid=auth["oid"],
+                tenant=auth.get("tenant"),
                 **kwargs,
             )
             if conversation_id is None:

@@ -8,6 +8,9 @@ services:
       # Bind inside the container; the host port is set under `ports` above.
       HOST: "0.0.0.0"
       PORT: "8000"
+      # Uncomment for a Microsoft 365 (work/school) account; sign in on the host
+      # with the same value, e.g. `COPILOT_PROFILE=enterprise python -m copilot login`.
+      # COPILOT_PROFILE: "enterprise"
       # Self-imposed rate limit (see server/config.py). Tune to your account.
       RATE_LIMIT_RPM: "12"
       RATE_LIMIT_BURST: "4"
