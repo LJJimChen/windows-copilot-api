@@ -87,12 +87,22 @@ venv\Scripts\Activate.ps1
 # Install dependencies
 pip install -r requirements.txt
 
-# Install the browser Playwright needs (one-time)
-playwright install chromium
-
-# Sign in once: a browser opens, log into your Microsoft or Google account
+# Sign in once: your installed Microsoft Edge opens, log into your Microsoft account
 python -m copilot login
 ```
+
+The bridge drives the browser **you already have** — Microsoft Edge by default —
+so there is nothing extra to download. Playwright's own Chromium is only needed
+where Edge isn't available (Docker, minimal Linux, CI):
+
+```bash
+playwright install chromium
+export COPILOT_BROWSER_CHANNEL=bundled   # use Playwright's Chromium instead of Edge
+```
+
+Chrome, Edge Beta and a custom binary are selectable too:
+`COPILOT_BROWSER_CHANNEL=chrome` or
+`COPILOT_BROWSER_EXECUTABLE="/path/to/browser"`.
 
 The browser **closes by itself** once sign-in is detected — you don't need to press Enter or close it manually. Choose **Yes** if Microsoft asks whether to stay signed in. The steps are logged to `session/login.log` if anything goes wrong. That's it: your token is saved under `session/` (git-ignored, never shared) and reused on every run. **After this, no browser is used:** chatting and token renewal are plain HTTP.
 
@@ -389,7 +399,7 @@ add a few retries yourself.
 
 | Path | What it does |
 | --- | --- |
-| [copilot/](copilot/) | The core library: `CopilotClient`, auth + token refresh, browser sign-in, HTTP driver, protocol, and the consumer/enterprise profiles ([copilot/profile.py](copilot/profile.py)) |
+| [copilot/](copilot/) | The core library: `CopilotClient`, auth + token refresh, browser sign-in ([copilot/launcher.py](copilot/launcher.py) picks your installed Edge), HTTP driver, protocol, and the consumer/enterprise profiles ([copilot/profile.py](copilot/profile.py)) |
 | [server/](server/) | The FastAPI OpenAI-compatible server |
 | [examples/](examples/) | Runnable examples for every feature ([examples/README.md](examples/README.md)) |
 | [tests/](tests/) | Test scripts: the concurrency stress test ([tests/stress.py](tests/stress.py)), the diagnostic & report tool ([tests/diagnostic.py](tests/diagnostic.py)), the enterprise capture helper ([tests/capture_enterprise.py](tests/capture_enterprise.py)), and the unit tests |
@@ -404,6 +414,10 @@ add a few retries yourself.
 - **Text only for now.** Image input isn't supported on the new copilot.com backend yet.
 - **One model.** Copilot has no model picker, so the server advertises a single model named `copilot`.
 - **Roughly GPT-4 class.** On GPQA Diamond (198 graduate-level questions, closed-book) it scores **40.9%**, which puts it in the GPT-4 family rather than the reasoning tier (o1/o3). Measured with [tests/gpqa_bench.py](tests/gpqa_bench.py).
+- **The browser is only for sign-in, and it's yours.** `python -m copilot login`
+  drives the installed Microsoft Edge (override with `COPILOT_BROWSER_CHANNEL`,
+  or point `COPILOT_BROWSER_EXECUTABLE` at any Chromium-family binary). Chatting
+  and token renewal stay pure HTTP.
 - **Your session is private.** Everything in `session/` (browser profile + tokens) stays on your machine and is git-ignored.
 
 ---

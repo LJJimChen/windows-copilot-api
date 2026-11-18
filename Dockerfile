@@ -11,6 +11,10 @@ RUN pip install --no-cache-dir -r requirements.txt \
 
 COPY . .
 
+# There is no Edge in a Linux container, so pin the bundled Chromium installed
+# above instead of letting the launcher try (and fail) the Edge channel first.
+ENV COPILOT_BROWSER_CHANNEL=bundled
+
 # Serve on all interfaces inside the container; map the port in compose.
 ENV HOST=0.0.0.0 \
     PORT=8000

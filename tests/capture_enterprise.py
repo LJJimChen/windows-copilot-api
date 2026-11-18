@@ -55,6 +55,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from playwright.sync_api import Error as PlaywrightError, sync_playwright  # noqa: E402
 
 from copilot.auth import DEFAULT_PROFILE_DIR, DEFAULT_AUTH_FILE  # noqa: E402
+from copilot.launcher import launch_persistent_context  # noqa: E402
 from copilot.profile import current_profile  # noqa: E402
 
 OUT = Path("session/enterprise_profile.json")
@@ -292,12 +293,12 @@ def main(argv) -> int:
 
     try:
         with sync_playwright() as pw:
-            context = pw.chromium.launch_persistent_context(
-                str(Path(DEFAULT_PROFILE_DIR).resolve()),
+            context, browser_name = launch_persistent_context(
+                pw,
+                Path(DEFAULT_PROFILE_DIR).resolve(),
                 headless=False,
-                args=["--disable-blink-features=AutomationControlled"],
-                ignore_default_args=["--enable-automation"],
             )
+            print(f"browser: {browser_name}")
             page = context.pages[0] if context.pages else context.new_page()
             page.on("websocket", capture.on_websocket)
             page.on("response", capture.on_response)
@@ -316,7 +317,12 @@ def main(argv) -> int:
                 pass
     except PlaywrightError as exc:
         print(f"browser failed: {exc}")
-        print("Is Chromium installed? Run: playwright install chromium")
+        print("Install Microsoft Edge, or run `playwright install chromium` and set "
+              "COPILOT_BROWSER_CHANNEL=bundled")
+        return 1
+    except RuntimeError as exc:
+        # copilot.launcher couldn't start any browser candidate.
+        print(f"browser failed: {exc}")
         return 1
     except KeyboardInterrupt:
         print("\ninterrupted; writing whatever was captured")

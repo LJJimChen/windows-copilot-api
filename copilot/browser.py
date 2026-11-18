@@ -3,8 +3,10 @@
 Playwright support for the pure-HTTP :class:`copilot.driver.Copilot`: it does NOT
 chat. Its only job is to sign in and capture the tokens the HTTP driver runs on.
 
-``BrowserCopilot`` launches a **persistent** Chromium profile so the sign-in
-survives restarts. When copilot.com loads signed in, its MSAL client requests a
+``BrowserCopilot`` launches a **persistent** browser profile — the one already
+installed on the machine (Microsoft Edge by default, see
+:mod:`copilot.launcher`) — so the sign-in survives restarts. When copilot.com
+loads signed in, its MSAL client requests a
 chat token (scope ``substrate.office.com/sydney``) from the token endpoint; we
 read that response — access token + refresh token — and the account id from the
 request. After that, :mod:`copilot.auth` renews the token over plain HTTP and the
@@ -30,6 +32,7 @@ from urllib.parse import parse_qs, urlparse
 from playwright.sync_api import Error as PlaywrightError, sync_playwright
 
 from .auth import DEFAULT_AUTH_FILE, DEFAULT_PROFILE_DIR, auth_from_token_response, save_auth
+from .launcher import launch_persistent_context
 from .profile import current_profile, login_hosts
 
 # Kept for backwards compatibility; the active profile's ``chat_url`` is used.
@@ -83,7 +86,7 @@ class BrowserCopilot:
     Parameters
     ----------
     profile_dir:
-        Directory for the persistent Chromium profile (cookies, sign-in).
+        Directory for the persistent browser profile (cookies, sign-in).
         Reused across runs.
     headless:
         Run without a visible window. Use ``False`` (or :meth:`login`) for the
@@ -111,6 +114,7 @@ class BrowserCopilot:
 
         self._pw = None
         self._context = None
+        self._browser = None
         self._page = None
         self._login_log_fh = None
         self._captured: Optional[dict] = None
@@ -126,23 +130,24 @@ class BrowserCopilot:
             self.headless = headless
         try:
             self._pw = sync_playwright().start()
-            # The browser presents its own, real User-Agent: pinning a fixed one
-            # contradicted the browser's client hints (issue #57).
-            launch_kwargs = dict(
+            # Drive the browser that is already installed (Edge by default) — see
+            # copilot.launcher. It presents its own, real User-Agent: pinning a
+            # fixed one contradicted the browser's client hints (issue #57).
+            self._context, self._browser = launch_persistent_context(
+                self._pw,
+                self.profile_dir,
                 headless=self.headless,
-                args=["--disable-blink-features=AutomationControlled"],
-                ignore_default_args=["--enable-automation"],
-            )
-            if self.proxy:
-                launch_kwargs["proxy"] = self._parse_proxy(self.proxy)
-            self._context = self._pw.chromium.launch_persistent_context(
-                self.profile_dir, **launch_kwargs
+                proxy=self._parse_proxy(self.proxy) if self.proxy else None,
             )
             self._restore_session_cookies()
             self._page = self._context.pages[0] if self._context.pages else self._context.new_page()
             self._page.set_default_timeout(self.nav_timeout * 1000)
             self._page.on("response", self._on_response)
         except PlaywrightError as exc:
+            self.close()
+            raise ConnectionError(f"Failed to start browser: {exc}") from exc
+        except RuntimeError as exc:
+            # Raised by copilot.launcher when no browser candidate could start.
             self.close()
             raise ConnectionError(f"Failed to start browser: {exc}") from exc
         return self
@@ -174,6 +179,7 @@ class BrowserCopilot:
                     pass
                 setattr(self, attr, None)
         self._page = None
+        self._browser = None
 
     def __enter__(self) -> "BrowserCopilot":
         return self.start()

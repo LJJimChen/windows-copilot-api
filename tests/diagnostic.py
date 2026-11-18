@@ -125,16 +125,22 @@ def packages_section(r: Report) -> None:
 
 
 def playwright_section(r: Report) -> None:
-    r.section("Playwright browser")
+    r.section("Browser (Playwright)")
     try:
         from playwright.sync_api import sync_playwright
 
+        from copilot.launcher import describe
+
+        r.line(f"preferred  : {describe()}")
         with sync_playwright() as pw:
             exe = Path(pw.chromium.executable_path)
-            r.line(f"chromium : {'present' if exe.exists() else 'MISSING'} ({exe})")
+            r.line(
+                f"bundled    : {'present' if exe.exists() else 'MISSING'} ({exe})"
+            )
     except Exception as e:  # noqa: BLE001 - report whatever went wrong
         r.line(f"could not query Playwright: {type(e).__name__}: {e}")
-        r.line("hint: run `playwright install chromium`")
+        r.line("hint: install Microsoft Edge, or run `playwright install chromium` "
+               "and set COPILOT_BROWSER_CHANNEL=bundled")
 
 
 def session_section(r: Report) -> None:
@@ -173,6 +179,7 @@ def browser_capture(r: Report) -> None:
         from playwright.sync_api import sync_playwright
 
         from copilot.auth import DEFAULT_PROFILE_DIR
+        from copilot.launcher import launch_persistent_context
     except Exception as e:  # noqa: BLE001
         r.line(f"skipped — Playwright unavailable: {type(e).__name__}: {e}")
         return
@@ -199,11 +206,12 @@ def browser_capture(r: Report) -> None:
 
     try:
         with sync_playwright() as pw:
-            ctx = pw.chromium.launch_persistent_context(
-                str(Path(DEFAULT_PROFILE_DIR).resolve()),
+            ctx, browser_name = launch_persistent_context(
+                pw,
+                Path(DEFAULT_PROFILE_DIR).resolve(),
                 headless=False,
-                args=["--disable-blink-features=AutomationControlled"],
             )
+            r.line(f"browser    : {browser_name}")
             page = ctx.pages[0] if ctx.pages else ctx.new_page()
 
             def on_ws(ws) -> None:

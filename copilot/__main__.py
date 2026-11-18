@@ -19,6 +19,7 @@ def _doctor() -> int:
 
     from .auth import DEFAULT_AUTH_FILE
     from .driver import AuthExpired, ClearanceRequired, LicenseRequired
+    from .launcher import describe as describe_browser
     from .profile import current_profile, tenant_from_anchor
 
     profile = current_profile()
@@ -27,6 +28,7 @@ def _doctor() -> int:
     print(f"chat url:   {profile.chat_url}")
     print("hub params: " + ", ".join(f"{k}={v}" for k, v in profile.hub_params.items()))
     print(f"hub tenant: {profile.default_tenant or '(taken from the signed-in account)'}")
+    print(f"browser:    {describe_browser()} (sign-in only)")
 
     # Read the snapshot directly: reporting must never start a browser.
     path = Path(DEFAULT_AUTH_FILE)
@@ -81,10 +83,12 @@ def main(argv) -> int:
     if cmd == "login":
         # The browser is used only for interactive sign-in / token capture.
         from .browser import BrowserCopilot
+        from .launcher import describe as describe_browser
         from .profile import current_profile
 
         profile = current_profile()
         print(f"Signing in for profile '{profile.name}' at {profile.chat_url}")
+        print(f"Browser: {describe_browser()}")
         BrowserCopilot(headless=False).login()
         return 0
     if cmd == "doctor":
