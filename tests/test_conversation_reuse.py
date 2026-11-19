@@ -231,7 +231,7 @@ class ReuseApiTests(unittest.TestCase):
         self.post([U1, A1, U2], tools=[tool])
 
         second_prompt = self.fake.calls[1][0]
-        self.assertIn("still enabled", second_prompt)
+        self.assertIn("Tool protocol unchanged", second_prompt)
         self.assertNotIn("<available_tools>", second_prompt)
 
 

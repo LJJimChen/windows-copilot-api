@@ -46,6 +46,9 @@ WEATHER_CALL = (
     "```"
 )
 
+# The format the prompt actually asks for.
+JSON_WEATHER_CALL = '{"tool_calls":[{"name":"get_weather","arguments":{"city":"Beijing"}}]}'
+
 
 class FakeStream:
     """Mimics ``copilot.ChatStream``: iterable text, id known after iteration."""
@@ -128,15 +131,35 @@ class ToolCallApiTests(unittest.TestCase):
         self.assertEqual(call["function"]["name"], "get_weather")
         self.assertEqual(json.loads(call["function"]["arguments"]), {"city": "Beijing"})
 
+    def test_bare_json_envelope_is_accepted(self):
+        self.fake.replies = [JSON_WEATHER_CALL]
+        response = self.post([{"role": "user", "content": "weather in Beijing?"}])
+
+        choice = response.json()["choices"][0]
+        self.assertEqual(choice["finish_reason"], "tool_calls")
+        call = choice["message"]["tool_calls"][0]
+        self.assertEqual(call["function"]["name"], "get_weather")
+        self.assertEqual(json.loads(call["function"]["arguments"]), {"city": "Beijing"})
+
     def test_tool_schemas_are_injected_into_the_prompt(self):
         self.fake.replies = ["plain answer"]
         self.post([{"role": "user", "content": "hi"}])
-
         prompt = self.fake.chat_calls[0][0]
         self.assertIn("## Tool calling", prompt)
         self.assertIn("get_weather", prompt)
         self.assertIn('"required"', prompt)
         self.assertIn('"city"', prompt)
+
+    def test_prompt_forbids_doing_the_work_itself(self):
+        self.fake.replies = ["plain answer"]
+        self.post([{"role": "user", "content": "write index.html"}])
+
+        prompt = self.fake.chat_calls[0][0]
+        self.assertIn("You have NO filesystem", prompt)
+        self.assertIn("NO sandbox", prompt)
+        self.assertIn("NEVER do the work yourself", prompt)
+        self.assertIn('"tool_calls"', prompt)
+        self.assertNotIn("```tool_call", prompt)
 
     def test_tool_choice_none_disables_tools(self):
         self.fake.replies = ["plain answer"]
@@ -246,6 +269,18 @@ class StreamingToolCallTests(unittest.TestCase):
         self.assertTrue(deltas[0]["id"].startswith("call_"))
         self.assertEqual(json.loads(deltas[1]["function"]["arguments"]), {"city": "Beijing"})
 
+        finish = [c["finish_reason"] for e in events for c in e["choices"] if c["finish_reason"]]
+        self.assertEqual(finish[-1], "tool_calls")
+
+    def test_streams_bare_json_envelope(self):
+        events = self.stream(JSON_WEATHER_CALL)
+        deltas = [
+            part
+            for event in events for choice in event["choices"]
+            for part in (choice["delta"].get("tool_calls") or [])
+        ]
+        self.assertEqual(deltas[0]["function"]["name"], "get_weather")
+        self.assertEqual(json.loads(deltas[1]["function"]["arguments"]), {"city": "Beijing"})
         finish = [c["finish_reason"] for e in events for c in e["choices"] if c["finish_reason"]]
         self.assertEqual(finish[-1], "tool_calls")
 

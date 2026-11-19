@@ -126,13 +126,18 @@ def _prepare(req: ChatCompletionRequest) -> _Prepared:
         else:
             system = ctx.full_prompt()
         prompt = continuation_prompt(
-            req.messages, len(state.fingerprints), system=system
+            req.messages,
+            len(state.fingerprints),
+            system=system,
+            tail=ctx.tail_cue() if ctx else None,
         )
         return _Prepared(prompt, state.conversation_id, ctx, fingerprints)
 
     # New (or explicitly addressed) conversation: it needs the whole history.
     system = ctx.full_prompt() if ctx else None
-    prompt = messages_to_prompt(req.messages, system=system)
+    prompt = messages_to_prompt(
+        req.messages, system=system, tail=ctx.tail_cue() if ctx else None
+    )
     return _Prepared(prompt, req.conversation_id, ctx, fingerprints)
 
 

@@ -232,9 +232,19 @@ From the client's side this is an ordinary function-calling loop
 response has `finish_reason: "tool_calls"` and `message.tool_calls`; send the
 results back as `role: "tool"` messages and continue.
 
+The model is told, in the injected instructions, that it has **no filesystem,
+shell, sandbox, canvas or code interpreter** and must not do the work itself —
+so a request like "write index.html" produces a tool call instead of Copilot
+rendering the file in its own cloud container. Its reply must be one bare JSON
+object (no fences, no prose):
+
+```json
+{"tool_calls":[{"name":"get_weather","arguments":{"city":"Oslo"}}]}
+```
+
 The parser also accepts the shapes other open-source stacks produce
-(`<tool_call>`, `[TOOL_CALLS]`, `<|tool_call|>`, DeepSeek blocks, bare JSON), so
-a model that drifts from the requested format still works. Guardrails:
+(`<tool_call>`, `[TOOL_CALLS]`, `<|tool_call|>`, DeepSeek blocks, fenced blocks),
+so a model that drifts from the requested format still works. Guardrails:
 
 - calls naming tools that weren't declared are **dropped** and returned as text;
 - `tool_choice: "required"` gets **one** corrective retry;

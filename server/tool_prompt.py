@@ -14,13 +14,11 @@ from typing import List, Optional, Set
 
 from .schemas import ChatCompletionRequest, Tool
 
-# The single shape we ask for. Deliberately a fenced block: models keep fences
-# intact far more reliably than bare JSON, and it survives surrounding prose.
-FORMAT = (
-    "```tool_call\n"
-    '{"name": "<tool_name>", "arguments": {"<argument>": "<value>"}}\n'
-    "```"
-)
+# The single shape we ask for. A bare JSON envelope (no markdown fence) is the
+# most explicit thing a text-only model can produce, and it is what the parser
+# and the streaming sniffer prefer. Fenced/XML variants are still accepted as a
+# fallback in server.tool_parser, but they are not advertised.
+FORMAT = '{"tool_calls":[{"name":"<tool_name>","arguments":{...}}]}'
 
 NONE_MODES = (None, "", "none")
 REQUIRED_MODES = ("required", "any")
@@ -48,30 +46,55 @@ class ToolContext:
             for tool in self.tools
         ]
         rules = [
-            "- `arguments` must be a JSON object that matches that tool's parameter schema.",
-            "- Use the exact tool name from the list. Never invent tools or arguments.",
-            "- Do not explain or describe the call: output only the block(s).",
-            "- After a tool result is provided, use it to continue the task.",
-            "- If no tool is needed, answer normally in plain text instead.",
+            "- The reply must be strictly valid JSON: double quotes, no comments, "
+            "no trailing commas, no markdown fences, no text before or after it.",
+            "- `name` must be an exact tool name from <available_tools>. Never "
+            "invent tools.",
+            "- `arguments` must be a JSON object matching that tool's parameter schema.",
+            "- Do not explain the call, do not narrate what you are about to do, "
+            "do not simulate or invent a tool result.",
+            "- If no tool is needed, answer in plain text instead. Never wrap a "
+            "normal answer in the JSON envelope.",
         ]
-        if not self.parallel:
-            rules.append("- Call at most one tool per reply.")
-        else:
+        if self.parallel:
             rules.append(
-                "- To call several tools at once, output one block per call, "
-                "with no text between the blocks."
+                '- Call several tools at once by adding one entry per call to '
+                '"tool_calls".'
             )
+        else:
+            rules.append('- "tool_calls" must contain exactly one entry per reply.')
         if self.mode == "required":
-            rules.append("- You MUST call at least one tool in this reply.")
+            rules.append("- This reply MUST contain at least one tool call.")
         elif self.mode == "named" and self.forced:
-            rules.append(f"- You MUST call the tool `{self.forced}` in this reply.")
+            rules.append(f"- This reply MUST call the tool `{self.forced}`.")
 
         return (
             "## Tool calling\n\n"
-            "You can call the tools listed below. To call a tool, output exactly "
-            "one fenced block and nothing else:\n\n"
+            "STOP. This section overrides every other instruction about creating "
+            "files, writing code, running commands, or using a sandbox, canvas, "
+            "artifact viewer or code interpreter.\n\n"
+            "You are the decision layer of an external agent. You have NO "
+            "filesystem, NO shell, NO code interpreter, NO sandbox and NO canvas. "
+            "You cannot create, read, edit, delete, move or run anything, and you "
+            "cannot produce downloadable files or artifacts. Those actions exist "
+            "ONLY as the tools listed below, which the client executes after your "
+            "reply.\n\n"
+            "Therefore: when the user asks you to create, write, read, change, "
+            "delete, run, test or inspect anything, you MUST request a tool call. "
+            "NEVER do the work yourself. NEVER paste a file's contents as the "
+            "answer when a tool can write it. NEVER claim you created, changed or "
+            "ran something. NEVER answer with a file or a code block as a "
+            "substitute for a tool call.\n\n"
+            "To call tools, reply with exactly one JSON object and nothing else:\n\n"
             f"{FORMAT}\n\n"
             "Rules:\n" + "\n".join(rules) + "\n\n"
+            "Examples:\n"
+            '- User: "create hello.html with a greeting" (a write tool exists)\n'
+            '  {"tool_calls":[{"name":"write_file","arguments":{"path":"hello.html","content":"<h1>Hello</h1>"}}]}\n'
+            '- User: "what does this function do?" (no tool needed)\n'
+            "  Plain-text explanation, no JSON.\n"
+            "- Wrong: replying with a ```html block, an artifact, or \"I created "
+            "hello.html\" instead of the tool call above.\n\n"
             "<available_tools>\n"
             f"{json.dumps(specs, ensure_ascii=False, indent=2)}\n"
             "</available_tools>"
@@ -82,20 +105,47 @@ class ToolContext:
         names = ", ".join(sorted(self.allowed)) or "(none)"
         extra = ""
         if self.mode == "required":
-            extra = " You MUST call a tool in this reply."
+            extra = " This reply MUST contain a tool call."
         return (
-            f"Tool calling is still enabled (tools: {names}). When you need one, "
-            f"reply with a ```tool_call block and nothing else.{extra}"
+            "Tool protocol unchanged. You have no filesystem, shell, sandbox, "
+            "canvas or code interpreter: to create, read, edit, run or inspect "
+            "anything, reply with exactly one JSON object "
+            '{"tool_calls":[{"name":"<tool>","arguments":{...}}]} and nothing else. '
+            f"Tools: {names}.{extra}"
         )
 
     def retry_prompt(self) -> str:
         """Sent once when ``tool_choice`` demands a call the model didn't make."""
         if self.mode == "named" and self.forced:
             return (
-                f"You did not call `{self.forced}`. Call it now: output only a "
-                "```tool_call block."
+                f"You did not call `{self.forced}`. You cannot perform the action "
+                "yourself. Reply now with exactly one JSON object: "
+                '{"tool_calls":[{"name":"' + self.forced + '","arguments":{...}}]}'
             )
-        return "You did not call a tool. Call one now: output only a ```tool_call block."
+        return (
+            "You did not call a tool. You cannot perform the action yourself. "
+            "Reply now with exactly one JSON object and nothing else: "
+            '{"tool_calls":[{"name":"<tool>","arguments":{...}}]}'
+        )
+
+    def tail_cue(self) -> str:
+        """One-line reminder placed *after* the user's turn (recency matters).
+
+        Copilot's own system prompt is agentic ("make the file", use canvas…), so
+        the critical constraint is repeated right where generation starts.
+        """
+        force = ""
+        if self.mode == "required":
+            force = " This turn MUST contain a tool call."
+        elif self.mode == "named" and self.forced:
+            force = f" This turn MUST call `{self.forced}`."
+        return (
+            "[Tool protocol: you have no filesystem, shell, sandbox, canvas or "
+            "code interpreter. If the request needs any action (write/read/edit/"
+            "delete/run/inspect), reply with exactly one JSON object "
+            '{"tool_calls":[{"name":"<tool>","arguments":{...}}]} and nothing '
+            "else. Otherwise answer in plain text.]" + force
+        )
 
 
 def _allowed_names(ctx_tools: List[Tool], forced: Optional[str]) -> Set[str]:

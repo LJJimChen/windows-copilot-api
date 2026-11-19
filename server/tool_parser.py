@@ -1,16 +1,17 @@
 """Parse tool calls out of plain-text model output.
 
-Copilot answers with text only, so the bridge asks for a fenced ``tool_call``
-block (see :mod:`server.tool_prompt`) and turns it back into OpenAI
-``tool_calls`` here. Because models drift, the parser accepts the shapes used by
-the common open-source tool parsers (vLLM's Hermes/Qwen, Mistral, llama.cpp,
+Copilot answers with text only, so the bridge asks for a single JSON object
+(see :mod:`server.tool_prompt`) and turns it back into OpenAI ``tool_calls``
+here. Because models drift, the parser also accepts the shapes used by the
+common open-source tool parsers (vLLM's Hermes/Qwen, Mistral, llama.cpp,
 DeepSeek), in a fixed priority order:
 
-    ```tool_call {"name": ..., "arguments": {...}} ```   our preferred format
+    {"tool_calls": [{"name": ..., "arguments": {...}}]}   our preferred format
+    ```tool_call {"name": ..., "arguments": {...}} ```   fenced variant
     <tool_call>{...}</tool_call>                         Hermes / Qwen
     [TOOL_CALLS] [{...}]                                 Mistral
     <|tool_call|>{...}                                   Llama 3.x style
-    <｜tool▁calls▁begin｜>function<｜tool▁sep｜>name ...          DeepSeek
+    DeepSeek function blocks (see _DEEPSEEK_NAME_RE)
     a bare JSON object/array with name + arguments       last resort
 
 Anything that isn't a valid, declared tool call is left alone (and the message
@@ -27,13 +28,22 @@ from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 # Cheap "did the model start emitting a tool call?" probes, used by the
 # streaming path to decide whether it must buffer the rest of the turn. Keep
 # every entry shorter than ``server.api.TOOL_HOLD``.
-OPENERS: Tuple[str, ...] = (
+#
+# The first entry is the preferred format (a bare JSON envelope); the rest are
+# tolerated fallbacks produced by other stacks (Hermes/Qwen, Mistral, llama.cpp,
+# DeepSeek). Only markers that are pure syntax debris are stripped from the
+# remaining text; the JSON opener is structural and is left for the parser.
+JSON_OPENERS: Tuple[str, ...] = (
+    '{"tool_calls"',
+)
+STRIP_MARKERS: Tuple[str, ...] = (
     "```tool_call",
     "<tool_call>",
     "[TOOL_CALLS]",
     "<|tool_call|>",
     "<｜tool▁calls▁begin｜>",
 )
+OPENERS: Tuple[str, ...] = JSON_OPENERS + STRIP_MARKERS
 
 _CLOSERS = ("</tool_call>", "<|/tool_call|>", "<｜tool▁calls▁end｜>", "<｜end_of_query｜>")
 
@@ -335,7 +345,7 @@ def _balanced(text: str, start: int = 0):
 
 def _clean_content(text: str) -> Optional[str]:
     """Drop leftover sentinel tokens/fences and normalize whitespace."""
-    for token in OPENERS:
+    for token in STRIP_MARKERS:
         text = text.replace(token, "")
     for token in _CLOSERS:
         text = text.replace(token, "")

@@ -68,6 +68,16 @@ class FormatTests(unittest.TestCase):
         )
         self.assert_call(reply, "search", {"q": "rust"})
 
+    def test_json_envelope_with_parallel_calls(self):
+        reply = call(
+            '{"tool_calls":['
+            '{"name":"get_weather","arguments":{"city":"Oslo"}},'
+            '{"name":"search","arguments":{"q":"oslo"}}]}'
+        )
+        self.assertEqual(
+            [c["function"]["name"] for c in reply.tool_calls], ["get_weather", "search"]
+        )
+
     def test_parallel_calls(self):
         reply = call(
             "```tool_call\n"
@@ -125,6 +135,7 @@ class ValidationTests(unittest.TestCase):
 class StreamingMarkerTests(unittest.TestCase):
     def test_detects_every_opener(self):
         for opener in (
+            '{"tool_calls"',
             "```tool_call",
             "<tool_call>",
             "[TOOL_CALLS]",
