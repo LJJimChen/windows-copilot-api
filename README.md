@@ -193,12 +193,99 @@ curl http://localhost:8000/v1/chat/completions \
 
 | Method | Path | Description |
 | --- | --- | --- |
-| `POST` | `/v1/chat/completions` | Chat (supports `"stream": true` and an optional `"conversation_id"`) |
+| `POST` | `/v1/chat/completions` | Chat: OpenAI `messages`, `tools` / `tool_choice`, `"stream": true`, optional `"conversation_id"` |
 | `GET`  | `/v1/models` | Lists the single `copilot` model |
 
 > Change the address with env vars: `HOST=0.0.0.0 PORT=8080 python app.py`, or run `uvicorn server.api:app --host 0.0.0.0 --port 8080`.
 
-👉 More: [examples/04_server_http.py](examples/04_server_http.py), [05_server_stream.py](examples/05_server_stream.py), [06_server_openai_sdk.py](examples/06_server_openai_sdk.py)
+👉 More: [examples/04_server_http.py](examples/04_server_http.py), [05_server_stream.py](examples/05_server_stream.py), [06_server_openai_sdk.py](examples/06_server_openai_sdk.py), [07_server_tool_calls.py](examples/07_server_tool_calls.py)
+
+### Tool calling (emulated)
+
+Copilot's consumer protocol answers with plain text only — there is no native
+function-calling channel. The server bridges that gap the same way local-model
+stacks do: it injects the tool schemas into the prompt, asks for a fenced
+```tool_call block, and parses it back into OpenAI `tool_calls`:
+
+```python
+resp = client.chat.completions.create(
+    model="copilot",
+    messages=[{"role": "user", "content": "Weather in Oslo?"}],
+    tools=[{
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "Current weather for a city",
+            "parameters": {
+                "type": "object",
+                "properties": {"city": {"type": "string"}},
+                "required": ["city"],
+            },
+        },
+    }],
+    tool_choice="auto",  # "auto" | "none" | "required" | {"type": "function", ...}
+)
+```
+
+From the client's side this is an ordinary function-calling loop
+([examples/07_server_tool_calls.py](examples/07_server_tool_calls.py)): the
+response has `finish_reason: "tool_calls"` and `message.tool_calls`; send the
+results back as `role: "tool"` messages and continue.
+
+The parser also accepts the shapes other open-source stacks produce
+(`<tool_call>`, `[TOOL_CALLS]`, `<|tool_call|>`, DeepSeek blocks, bare JSON), so
+a model that drifts from the requested format still works. Guardrails:
+
+- calls naming tools that weren't declared are **dropped** and returned as text;
+- `tool_choice: "required"` gets **one** corrective retry;
+- `parallel_tool_calls: false` keeps only the first call;
+- `tool_choice: "none"` injects no tools at all;
+- streamed tool calls arrive once the turn is complete (arguments are not
+  token-streamed), which every OpenAI-compatible client accepts.
+
+Coding agents such as [pi](https://pi.dev) work through their normal
+OpenAI-compatible provider config — no extra fields needed:
+
+```json
+{
+  "providers": {
+    "copilot": {
+      "baseUrl": "http://127.0.0.1:8000/v1",
+      "api": "openai-completions",
+      "apiKey": "unused",
+      "compat": {
+        "supportsUsageInStreaming": false,
+        "supportsDeveloperRole": false,
+        "supportsReasoningEffort": false
+      },
+      "models": [{ "id": "copilot", "input": ["text"], "contextWindow": 128000, "maxTokens": 8192 }]
+    }
+  }
+}
+```
+
+### Conversation reuse
+
+OpenAI clients resend the whole conversation on every call; Copilot threads are
+stateful. The server fingerprints the resent history and, when it matches a
+thread it already knows, sends **only the new tail** (a user message or the tool
+results) instead of the whole conversation again. It works with any client — no
+extra field or header needed — and when the client edits, trims or compacts its
+history the fingerprint stops matching and a fresh thread is started
+automatically.
+
+That cache is in memory, per process, and bounded:
+
+| Env var | Default | Meaning |
+| --- | --- | --- |
+| `SESSION_TTL` | `1800` | seconds an idle conversation stays reusable |
+| `SESSION_MAX` | `64` | max conversations tracked (LRU) |
+| `SESSION_REGENERATE_WINDOW` | `300` | identical history within this window counts as a retry |
+
+The explicit `conversation_id` field still works and is used when no history
+match is found; on the first turn with it the whole history is resent (legacy
+behaviour).
+
 
 ---
 

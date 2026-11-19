@@ -22,3 +22,4 @@ Start the server first in another terminal: `python app.py`
 | [04_server_http.py](04_server_http.py) | Plain HTTP with `requests` (chat + continue) |
 | [05_server_stream.py](05_server_stream.py) | Streaming over Server-Sent Events |
 | [06_server_openai_sdk.py](06_server_openai_sdk.py) | The official `openai` SDK (`pip install openai`) |
+| [07_server_tool_calls.py](07_server_tool_calls.py) | A full tool-calling loop (tools + `role: "tool"` results) |

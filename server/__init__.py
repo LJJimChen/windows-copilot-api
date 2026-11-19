@@ -15,6 +15,9 @@ Code is split by concern:
     config.py         constants
     schemas.py        pydantic request models
     prompt.py         flatten OpenAI messages -> one Copilot prompt
+    tool_prompt.py    compile OpenAI tools into prompt instructions
+    tool_parser.py    parse tool calls back out of plain-text replies
+    sessions.py       fingerprint history -> reuse the matching conversation
     openai_format.py  build OpenAI response/chunk shapes
     api.py            FastAPI app, routes, upstream serialization
 """
