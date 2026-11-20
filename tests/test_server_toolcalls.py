@@ -40,14 +40,18 @@ SEARCH = {
     },
 }
 
+# The routing envelope the prompt asks for.
 WEATHER_CALL = (
-    "```tool_call\n"
-    '{"name": "get_weather", "arguments": {"city": "Beijing"}}\n'
-    "```"
+    '{"content":null,"tool_calls":'
+    '[{"name":"get_weather","arguments":{"city":"Beijing"}}]}'
 )
-
-# The format the prompt actually asks for.
-JSON_WEATHER_CALL = '{"tool_calls":[{"name":"get_weather","arguments":{"city":"Beijing"}}]}'
+ANSWER = '{"content":"Beijing is warm today.","tool_calls":[]}'
+TWO_CALLS = (
+    '{"content":null,"tool_calls":['
+    '{"name":"get_weather","arguments":{"city":"Oslo"}},'
+    '{"name":"search","arguments":{"q":"oslo"}}]}'
+)
+UNKNOWN_CALL = '{"content":null,"tool_calls":[{"name":"rm_rf","arguments":{}}]}'
 
 
 class FakeStream:
@@ -131,47 +135,52 @@ class ToolCallApiTests(unittest.TestCase):
         self.assertEqual(call["function"]["name"], "get_weather")
         self.assertEqual(json.loads(call["function"]["arguments"]), {"city": "Beijing"})
 
-    def test_bare_json_envelope_is_accepted(self):
-        self.fake.replies = [JSON_WEATHER_CALL]
+    def test_fenced_json_envelope_is_accepted(self):
+        self.fake.replies = ["```json\n" + WEATHER_CALL + "\n```"]
         response = self.post([{"role": "user", "content": "weather in Beijing?"}])
 
         choice = response.json()["choices"][0]
         self.assertEqual(choice["finish_reason"], "tool_calls")
-        call = choice["message"]["tool_calls"][0]
-        self.assertEqual(call["function"]["name"], "get_weather")
-        self.assertEqual(json.loads(call["function"]["arguments"]), {"city": "Beijing"})
+        self.assertEqual(choice["message"]["tool_calls"][0]["function"]["name"], "get_weather")
+
+    def test_normal_answer_envelope(self):
+        self.fake.replies = [ANSWER]
+        response = self.post([{"role": "user", "content": "weather?"}])
+
+        choice = response.json()["choices"][0]
+        self.assertEqual(choice["finish_reason"], "stop")
+        self.assertEqual(choice["message"]["content"], "Beijing is warm today.")
+        self.assertNotIn("tool_calls", choice["message"])
 
     def test_tool_schemas_are_injected_into_the_prompt(self):
-        self.fake.replies = ["plain answer"]
+        self.fake.replies = [ANSWER]
         self.post([{"role": "user", "content": "hi"}])
         prompt = self.fake.chat_calls[0][0]
-        self.assertIn("## Tool calling", prompt)
+        self.assertIn("routing decision", prompt)
         self.assertIn("get_weather", prompt)
         self.assertIn('"required"', prompt)
         self.assertIn('"city"', prompt)
+        self.assertIn('"content"', prompt)
 
     def test_prompt_forbids_doing_the_work_itself(self):
-        self.fake.replies = ["plain answer"]
+        self.fake.replies = [ANSWER]
         self.post([{"role": "user", "content": "write index.html"}])
 
         prompt = self.fake.chat_calls[0][0]
-        self.assertIn("You have NO filesystem", prompt)
-        self.assertIn("NO sandbox", prompt)
-        self.assertIn("NEVER do the work yourself", prompt)
+        self.assertIn("NOT being asked to execute a function", prompt)
+        self.assertIn("You also have NO filesystem", prompt)
+        self.assertIn("sandbox", prompt)
+        self.assertIn("NEVER paste a file's contents", prompt)
         self.assertIn('"tool_calls"', prompt)
-        self.assertNotIn("```tool_call", prompt)
 
     def test_tool_choice_none_disables_tools(self):
         self.fake.replies = ["plain answer"]
-        self.post(
-            [{"role": "user", "content": "hi"}],
-            tool_choice="none",
-        )
+        self.post([{"role": "user", "content": "hi"}], tool_choice="none")
         prompt = self.fake.chat_calls[0][0]
-        self.assertNotIn("## Tool calling", prompt)
+        self.assertNotIn("routing decision", prompt)
 
     def test_unknown_tool_is_not_forwarded(self):
-        self.fake.replies = ['```tool_call\n{"name":"rm_rf","arguments":{}}\n```']
+        self.fake.replies = [UNKNOWN_CALL, UNKNOWN_CALL]
         response = self.post([{"role": "user", "content": "drop everything"}])
 
         choice = response.json()["choices"][0]
@@ -179,7 +188,7 @@ class ToolCallApiTests(unittest.TestCase):
         self.assertNotIn("tool_calls", choice["message"])
         self.assertIn("rm_rf", choice["message"]["content"])
 
-    def test_required_tool_choice_retries_once(self):
+    def test_invalid_envelope_retries_once(self):
         self.fake.replies = ["I would rather just answer.", WEATHER_CALL]
         response = self.post(
             [{"role": "user", "content": "weather?"}],
@@ -187,7 +196,7 @@ class ToolCallApiTests(unittest.TestCase):
         )
 
         self.assertEqual(len(self.fake.chat_calls), 2)
-        self.assertIn("did not call a tool", self.fake.chat_calls[1][0])
+        self.assertIn("not a valid routing decision", self.fake.chat_calls[1][0])
         choice = response.json()["choices"][0]
         self.assertEqual(choice["finish_reason"], "tool_calls")
 
@@ -202,26 +211,32 @@ class ToolCallApiTests(unittest.TestCase):
         self.assertNotIn('"search"', prompt)
 
     def test_parallel_tool_calls_can_be_disabled(self):
-        self.fake.replies = [
-            "```tool_call\n"
-            '{"name":"get_weather","arguments":{"city":"Oslo"}}\n'
-            "```\n```tool_call\n"
-            '{"name":"search","arguments":{"q":"oslo"}}\n'
-            "```"
-        ]
+        self.fake.replies = [TWO_CALLS, WEATHER_CALL]
         response = self.post(
             [{"role": "user", "content": "both"}],
             parallel_tool_calls=False,
         )
+        self.assertEqual(len(self.fake.chat_calls), 2)  # protocol retry
         calls = response.json()["choices"][0]["message"]["tool_calls"]
         self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["function"]["name"], "get_weather")
 
-    def test_plain_text_when_model_ignores_tools(self):
-        self.fake.replies = ["Beijing is warm today."]
+    def test_prose_is_retried_then_accepted(self):
+        self.fake.replies = ["Beijing is warm.", ANSWER]
         response = self.post([{"role": "user", "content": "weather?"}])
+
+        choice = response.json()["choices"][0]
+        self.assertEqual(choice["message"]["content"], "Beijing is warm today.")
+        self.assertEqual(len(self.fake.chat_calls), 2)
+
+    def test_raw_text_when_model_never_complies(self):
+        self.fake.replies = ["Beijing is warm.", "Still just prose."]
+        response = self.post([{"role": "user", "content": "weather?"}])
+
         choice = response.json()["choices"][0]
         self.assertEqual(choice["finish_reason"], "stop")
-        self.assertEqual(choice["message"]["content"], "Beijing is warm today.")
+        self.assertEqual(choice["message"]["content"], "Still just prose.")
+        self.assertEqual(len(self.fake.chat_calls), 2)
 
 
 class StreamingToolCallTests(unittest.TestCase):
@@ -237,95 +252,76 @@ class StreamingToolCallTests(unittest.TestCase):
             self.addCleanup(patcher.stop)
         self.http = TestClient(server_api.app)
 
-    def stream(self, text, **extra):
-        self.fake.replies = [text]
+    def stream(self, *replies, tools=True, **extra):
+        self.fake.replies = list(replies)
         payload = {
             "messages": [{"role": "user", "content": "hi"}],
-            "tools": [WEATHER],
             "stream": True,
         }
+        if tools:
+            payload["tools"] = [WEATHER]
         payload.update(extra)
         with self.http.stream("POST", "/v1/chat/completions", json=payload) as response:
             self.assertEqual(response.status_code, 200)
             return sse_events("".join(response.iter_text()))
 
-    def test_streams_tool_calls_and_finish_reason(self):
-        events = self.stream(WEATHER_CALL)
-
-        content = "".join(
+    def content_of(self, events):
+        return "".join(
             choice["delta"].get("content", "")
             for event in events for choice in event["choices"]
             if choice.get("delta")
         )
-        self.assertNotIn("tool_call", content)  # the raw block must not leak
 
-        deltas = [
+    def tool_deltas(self, events):
+        return [
             part
             for event in events for choice in event["choices"]
             for part in (choice["delta"].get("tool_calls") or [])
         ]
+
+    def finish_of(self, events):
+        return [
+            c["finish_reason"] for e in events for c in e["choices"] if c["finish_reason"]
+        ][-1]
+
+    def test_streams_tool_calls_and_finish_reason(self):
+        events = self.stream(WEATHER_CALL)
+
+        self.assertNotIn("tool_calls", self.content_of(events))  # raw JSON must not leak
+        deltas = self.tool_deltas(events)
         self.assertEqual(deltas[0]["index"], 0)
         self.assertEqual(deltas[0]["function"]["name"], "get_weather")
         self.assertTrue(deltas[0]["id"].startswith("call_"))
         self.assertEqual(json.loads(deltas[1]["function"]["arguments"]), {"city": "Beijing"})
+        self.assertEqual(self.finish_of(events), "tool_calls")
 
-        finish = [c["finish_reason"] for e in events for c in e["choices"] if c["finish_reason"]]
-        self.assertEqual(finish[-1], "tool_calls")
+    def test_streams_normal_answer_envelope(self):
+        events = self.stream(ANSWER)
+        self.assertEqual(self.content_of(events), "Beijing is warm today.")
+        self.assertEqual(self.tool_deltas(events), [])
+        self.assertEqual(self.finish_of(events), "stop")
 
-    def test_streams_bare_json_envelope(self):
-        events = self.stream(JSON_WEATHER_CALL)
-        deltas = [
-            part
-            for event in events for choice in event["choices"]
-            for part in (choice["delta"].get("tool_calls") or [])
-        ]
-        self.assertEqual(deltas[0]["function"]["name"], "get_weather")
-        self.assertEqual(json.loads(deltas[1]["function"]["arguments"]), {"city": "Beijing"})
-        finish = [c["finish_reason"] for e in events for c in e["choices"] if c["finish_reason"]]
-        self.assertEqual(finish[-1], "tool_calls")
-
-    def test_streams_plain_text_unchanged(self):
+    def test_streams_without_tools_unchanged(self):
         text = "A perfectly normal, fairly long answer that arrives in many pieces."
-        events = self.stream(text)
-        content = "".join(
-            choice["delta"].get("content", "")
-            for event in events for choice in event["choices"]
-            if choice.get("delta")
-        )
-        self.assertEqual(content, text)
+        events = self.stream(text, tools=False)
+        self.assertEqual(self.content_of(events), text)
 
     def test_required_tool_choice_buffers_and_retries(self):
-        self.fake.replies = ["prose only", WEATHER_CALL]
-        payload = {
-            "messages": [{"role": "user", "content": "weather?"}],
-            "tools": [WEATHER],
-            "tool_choice": "required",
-            "stream": True,
-        }
-        with self.http.stream("POST", "/v1/chat/completions", json=payload) as response:
-            events = sse_events("".join(response.iter_text()))
+        events = self.stream("prose only", WEATHER_CALL, tool_choice="required")
 
         self.assertEqual(len(self.fake.stream_calls), 1)
         self.assertEqual(len(self.fake.chat_calls), 1)  # the retry
-        finish = [c["finish_reason"] for e in events for c in e["choices"] if c["finish_reason"]]
-        self.assertEqual(finish[-1], "tool_calls")
+        self.assertEqual(self.finish_of(events), "tool_calls")
 
     def test_streamed_conversation_is_reused_for_the_tool_result_turn(self):
-        self.fake.replies = [WEATHER_CALL]
-        payload = {
-            "messages": [{"role": "user", "content": "weather?"}],
-            "tools": [WEATHER],
-            "stream": True,
-        }
-        with self.http.stream("POST", "/v1/chat/completions", json=payload) as response:
-            events = sse_events("".join(response.iter_text()))
+        events = self.stream(WEATHER_CALL)
         final = [e for e in events if e["choices"][0]["finish_reason"]][-1]
         conversation_id = final["conversation_id"]
 
-        self.fake.replies = ["Sunny, 3C."]
+        self.fake.replies = [ANSWER]
         second = self.http.post("/v1/chat/completions", json={
             "messages": [
-                {"role": "user", "content": "weather?"},
+                {"role": "user", "content": "hi"},
                 {
                     "role": "assistant",
                     "content": None,

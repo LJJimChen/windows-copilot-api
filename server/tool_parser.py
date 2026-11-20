@@ -1,56 +1,36 @@
-"""Parse tool calls out of plain-text model output.
+"""Parse the model's JSON routing decision into OpenAI tool calls.
 
-Copilot answers with text only, so the bridge asks for a single JSON object
-(see :mod:`server.tool_prompt`) and turns it back into OpenAI ``tool_calls``
-here. Because models drift, the parser also accepts the shapes used by the
-common open-source tool parsers (vLLM's Hermes/Qwen, Mistral, llama.cpp,
-DeepSeek), in a fixed priority order:
+Copilot has no function-calling channel, so :mod:`server.tool_prompt` asks for
+exactly one JSON object per turn:
 
-    {"tool_calls": [{"name": ..., "arguments": {...}}]}   our preferred format
-    ```tool_call {"name": ..., "arguments": {...}} ```   fenced variant
-    <tool_call>{...}</tool_call>                         Hermes / Qwen
-    [TOOL_CALLS] [{...}]                                 Mistral
-    <|tool_call|>{...}                                   Llama 3.x style
-    DeepSeek function blocks (see _DEEPSEEK_NAME_RE)
-    a bare JSON object/array with name + arguments       last resort
+    {"content": "answer or null",
+     "tool_calls": [{"name": "function_name", "arguments": {...}}]}
 
-Anything that isn't a valid, declared tool call is left alone (and the message
-is returned as plain text), so a hallucinated call can never reach the client.
+This module is deliberately strict: anything that does not match that envelope
+exactly raises :class:`ToolOutputError`. The caller retries once with a
+corrective prompt and then falls back to returning the text, so a malformed or
+hallucinated reply can never reach the client as a fake tool call.
+
+Being strict is also what makes the routing protocol safe: the model cannot
+smuggle a call in prose, a markdown fence, or an undeclared function name.
 """
 
-import ast
 import json
-import re
 import uuid
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set
 
-# Cheap "did the model start emitting a tool call?" probes, used by the
-# streaming path to decide whether it must buffer the rest of the turn. Keep
-# every entry shorter than ``server.api.TOOL_HOLD``.
-#
-# The first entry is the preferred format (a bare JSON envelope); the rest are
-# tolerated fallbacks produced by other stacks (Hermes/Qwen, Mistral, llama.cpp,
-# DeepSeek). Only markers that are pure syntax debris are stripped from the
-# remaining text; the JSON opener is structural and is left for the parser.
-JSON_OPENERS: Tuple[str, ...] = (
-    '{"tool_calls"',
-)
-STRIP_MARKERS: Tuple[str, ...] = (
-    "```tool_call",
-    "<tool_call>",
-    "[TOOL_CALLS]",
-    "<|tool_call|>",
-    "<｜tool▁calls▁begin｜>",
-)
-OPENERS: Tuple[str, ...] = JSON_OPENERS + STRIP_MARKERS
+ENVELOPE_KEYS = {"content", "tool_calls"}
+CALL_KEYS = {"name", "arguments"}
 
-_CLOSERS = ("</tool_call>", "<|/tool_call|>", "<｜tool▁calls▁end｜>", "<｜end_of_query｜>")
+
+class ToolOutputError(ValueError):
+    """The reply was not a valid routing envelope."""
 
 
 @dataclass
 class ParsedReply:
-    """Result of parsing one upstream reply."""
+    """One validated upstream reply."""
 
     content: Optional[str]
     tool_calls: List[Dict[str, Any]]
@@ -61,295 +41,101 @@ class ParsedReply:
         return bool(self.tool_calls)
 
 
-def first_marker(text: str) -> Optional[int]:
-    """Index of the earliest tool-call opener in ``text``, or ``None``."""
-    found = [idx for idx in (text.find(opener) for opener in OPENERS) if idx != -1]
-    return min(found) if found else None
+def _reject_constant(value: str) -> Any:
+    """``json.loads`` hook: NaN/Infinity are not valid JSON."""
+    raise ValueError(f"non-standard JSON constant {value!r}")
 
 
-def parse_tool_calls(text: str, allowed: Optional[Iterable[str]] = None) -> ParsedReply:
-    """Split ``text`` into assistant content + validated OpenAI ``tool_calls``."""
-    allowed_set: Optional[Set[str]] = set(allowed) if allowed else None
-    spans = _collect_spans(text or "", allowed_set)
-
-    calls: List[Dict[str, Any]] = []
-    chunks: List[str] = []
-    cursor = 0
-    for start, end, found in spans:
-        if start > cursor:
-            chunks.append(text[cursor:start])
-        cursor = max(cursor, end)
-        calls.extend(found)
-    if cursor < len(text):
-        chunks.append(text[cursor:])
-
-    content = _clean_content("".join(chunks))
-    return ParsedReply(content, calls, text or "")
+def _unique_object(pairs: List[tuple]) -> Dict[str, Any]:
+    """``json.loads`` hook: reject duplicate object keys."""
+    data: Dict[str, Any] = {}
+    for key, value in pairs:
+        if key in data:
+            raise ValueError(f"duplicate JSON key {key!r}")
+        data[key] = value
+    return data
 
 
-# --------------------------------------------------------------------------- #
-# Span extraction
-# --------------------------------------------------------------------------- #
-
-_FENCE_RE = re.compile(r"```[ \t]*(tool_call|tool_calls|json)?[ \t]*\r?\n?(.*?)```", re.S)
-_XML_RE = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.S)
-_DEEPSEEK_NAME_RE = re.compile(r"function<｜tool▁sep｜>\s*([^\s`\n]+)")
-
-
-def _collect_spans(text: str, allowed: Optional[Set[str]]) -> List[Tuple[int, int, List[dict]]]:
-    """Find tool-call regions, most specific extractor first, without overlap."""
-    candidates: List[Tuple[int, int, List[dict]]] = []
-
-    # 1. fenced blocks. Tagged tool_call blocks are trusted; a generic ```json
-    #    fence only counts when it actually looks like a call.
-    for match in _FENCE_RE.finditer(text):
-        tag = (match.group(1) or "").lower()
-        calls = _calls_from_body(match.group(2), allowed, trusted=tag != "json")
-        if calls:
-            candidates.append((match.start(), match.end(), calls))
-
-    # 2. <tool_call>...</tool_call> (Hermes, Qwen, ...)
-    for match in _XML_RE.finditer(text):
-        calls = _calls_from_body(match.group(1), allowed, trusted=True)
-        if calls:
-            candidates.append((match.start(), match.end(), calls))
-
-    # 3. [TOOL_CALLS] followed by a JSON array/object (Mistral).
-    candidates.extend(_marker_spans(text, "[TOOL_CALLS]", allowed))
-
-    # 4. <|tool_call|> followed by a JSON object (Llama 3.x style).
-    candidates.extend(_marker_spans(text, "<|tool_call|>", allowed))
-
-    # 5. DeepSeek function blocks.
-    candidates.extend(_deepseek_spans(text, allowed))
-
-    candidates.sort(key=lambda item: (item[0], -(item[1] - item[0])))
-    spans: List[Tuple[int, int, List[dict]]] = []
-    for start, end, calls in candidates:
-        if any(start < existing_end and existing_start < end
-               for existing_start, existing_end, _ in spans):
-            continue
-        spans.append((start, end, calls))
-
-    # 6. Last resort: a bare JSON object/array that names a declared tool. Only
-    #    outside regions already claimed above, so fenced/tagged calls aren't
-    #    parsed twice.
-    for start, end, raw in _balanced(text):
-        if any(start < s_end and s_start < end for s_start, s_end, _ in spans):
-            continue
-        calls = _calls_from_body(raw, allowed, trusted=False)
-        if calls:
-            spans.append((start, end, calls))
-
-    spans.sort(key=lambda item: item[0])
-    return spans
+def _strip_fence(text: str) -> str:
+    """Allow the object to be wrapped in a single ```json fence."""
+    raw = (text or "").strip()
+    if raw.startswith("```") and raw.endswith("```"):
+        lines = raw.splitlines()
+        if lines and lines[0].strip() in ("```", "```json"):
+            raw = "\n".join(lines[1:-1]).strip()
+    return raw
 
 
-def _marker_spans(text: str, marker: str, allowed: Optional[Set[str]]):
-    spans = []
-    cursor = 0
-    while True:
-        idx = text.find(marker, cursor)
-        if idx == -1:
-            return spans
-        payload_start = idx + len(marker)
-        found = next(_balanced(text, payload_start), None)
-        if found is None:
-            cursor = payload_start
-            continue
-        start, end, raw = found
-        calls = _calls_from_body(raw, allowed, trusted=True)
-        if calls:
-            spans.append((idx, end, calls))
-        cursor = end
+def parse_tool_output(
+    text: str,
+    *,
+    allowed: Set[str],
+    mode: str = "auto",
+    forced: Optional[str] = None,
+    parallel: bool = True,
+) -> ParsedReply:
+    """Validate one reply and convert it into OpenAI ``tool_calls``.
 
-
-def _deepseek_spans(text: str, allowed: Optional[Set[str]]):
-    spans = []
-    for match in _DEEPSEEK_NAME_RE.finditer(text):
-        name = match.group(1).strip()
-        brace = text.find("{", match.end())
-        if brace == -1:
-            continue
-        found = next(_balanced(text, brace), None)
-        if found is None:
-            continue
-        _, end, raw = found
-        obj = _loads(raw)
-        if not isinstance(obj, dict):
-            continue
-        calls = _normalize({"name": name, "arguments": obj}, allowed)
-        if calls:
-            # Include the surrounding wrapper tokens when they are right there.
-            start = match.start()
-            for opener in ("<｜tool▁call▁begin｜>", "<｜tool▁calls▁begin｜>"):
-                pos = text.rfind(opener, 0, start)
-                if pos != -1:
-                    start = pos
-                    break
-            # The call's JSON is usually wrapped in a ```json fence inside the
-            # block; swallow the closing fence that follows the object.
-            closing = re.match(r"\s*```", text[end:])
-            if closing:
-                end += closing.end()
-            spans.append((start, end, calls))
-    return spans
-
-
-def _calls_from_body(body: str, allowed: Optional[Set[str]], trusted: bool) -> List[dict]:
-    """Normalize every call-shaped object/array found in ``body``."""
-    calls: List[dict] = []
-    for _, _, raw in _balanced(body):
-        obj = _loads(raw)
-        for candidate in _as_candidates(obj):
-            if not trusted and not _looks_like_call(candidate, allowed):
-                continue
-            calls.extend(_normalize(candidate, allowed))
-    return calls
-
-
-def _as_candidates(obj: Any) -> List[Any]:
-    if isinstance(obj, list):
-        return obj
-    if isinstance(obj, dict):
-        return [obj]
-    return []
-
-
-def _looks_like_call(obj: Any, allowed: Optional[Set[str]]) -> bool:
-    """Conservative test for un-tagged JSON found in the wild."""
-    if not isinstance(obj, dict):
-        return False
-    if isinstance(obj.get("tool_calls"), list):
-        return True
-    function = obj.get("function")
-    if isinstance(function, dict) and isinstance(function.get("name"), str):
-        return True
-    name = obj.get("name")
-    if not isinstance(name, str):
-        return False
-    if "arguments" in obj or "parameters" in obj:
-        return True
-    # A no-argument tool is only believable when we actually declared that name.
-    return bool(allowed and name in allowed)
-
-
-def _normalize(obj: Any, allowed: Optional[Set[str]]) -> List[dict]:
-    """Turn one object into OpenAI-shaped tool calls, or ``[]``."""
-    if not isinstance(obj, dict):
-        return []
-    if isinstance(obj.get("tool_calls"), list):
-        calls: List[dict] = []
-        for inner in obj["tool_calls"]:
-            calls.extend(_normalize(inner, allowed))
-        return calls
-
-    function = obj.get("function")
-    if isinstance(function, dict):
-        name = function.get("name")
-        arguments = function.get("arguments", function.get("parameters", {}))
-    else:
-        name = obj.get("name")
-        arguments = obj.get("arguments", obj.get("parameters", {}))
-
-    if not isinstance(name, str) or not name.strip():
-        return []
-    name = name.strip()
-    if allowed is not None and name not in allowed:
-        return []  # hallucinated tool: drop it instead of forwarding
-
-    if isinstance(arguments, str):
-        parsed = _loads(arguments)
-        if parsed is None:
-            return []  # unparseable argument string: not a usable call
-        arguments = parsed
-    if arguments is None:
-        arguments = {}
-    if not isinstance(arguments, dict):
-        return []
-
-    return [{
-        "id": f"call_{uuid.uuid4().hex[:24]}",
-        "type": "function",
-        "function": {
-            "name": name,
-            "arguments": json.dumps(arguments, ensure_ascii=False),
-        },
-    }]
-
-
-# --------------------------------------------------------------------------- #
-# Low-level helpers
-# --------------------------------------------------------------------------- #
-
-def _loads(raw: str) -> Any:
-    """Parse JSON with the leniency local models need (single quotes, comments …)."""
-    raw = raw.strip()
-    for attempt in (
-        raw,
-        re.sub(r",\s*([}\]])", r"\1", raw),  # trailing commas
-    ):
-        try:
-            return json.loads(attempt)
-        except Exception:
-            pass
-    try:
-        return ast.literal_eval(raw)  # Python literals: single quotes, True/None
-    except Exception:
-        return None
-
-
-def _balanced(text: str, start: int = 0):
-    """Yield ``(start, end, substring)`` for top-level JSON objects/arrays.
-
-    Tracks nesting and string escapes, so braces inside argument strings don't
-    end the scan early. An unbalanced ``{`` (ordinary prose, a truncated stream)
-    is skipped rather than aborting the scan, so a later valid object is still
-    found.
+    ``mode`` is ``"auto"``, ``"required"`` or ``"named"``; ``forced`` is the
+    function name for the latter. Raises :class:`ToolOutputError` on any
+    deviation from the protocol.
     """
-    index = start
-    length = len(text)
-    while index < length:
-        if text[index] not in "{[":
-            index += 1
-            continue
-        depth = 0
-        quote = None
-        escaped = False
-        cursor = index
-        closed = False
-        while cursor < length:
-            current = text[cursor]
-            if quote:
-                if escaped:
-                    escaped = False
-                elif current == "\\":
-                    escaped = True
-                elif current == quote:
-                    quote = None
-            elif current in "\"'":
-                quote = current
-            elif current in "{[":
-                depth += 1
-            elif current in "}]":
-                depth -= 1
-                if depth == 0:
-                    yield index, cursor + 1, text[index:cursor + 1]
-                    index = cursor + 1
-                    closed = True
-                    break
-            cursor += 1
-        if not closed:
-            index += 1  # unbalanced opener: skip it and keep scanning
+    raw = _strip_fence(text)
+    try:
+        data = json.loads(
+            raw,
+            parse_constant=_reject_constant,
+            object_pairs_hook=_unique_object,
+        )
+    except ValueError as exc:
+        raise ToolOutputError("the reply is not valid JSON") from exc
 
+    if not isinstance(data, dict) or set(data) != ENVELOPE_KEYS:
+        raise ToolOutputError(
+            'the reply must be an object with exactly "content" and "tool_calls"'
+        )
 
-def _clean_content(text: str) -> Optional[str]:
-    """Drop leftover sentinel tokens/fences and normalize whitespace."""
-    for token in STRIP_MARKERS:
-        text = text.replace(token, "")
-    for token in _CLOSERS:
-        text = text.replace(token, "")
-    text = re.sub(r"\n{3,}", "\n\n", text).strip()
-    # A fence that only wrapped a call can leave an empty ``` pair behind.
-    text = re.sub(r"(?m)^```[ \t]*$", "", text).strip()
-    return text or None
+    content, calls = data["content"], data["tool_calls"]
+    if not isinstance(calls, list) or not (content is None or isinstance(content, str)):
+        raise ToolOutputError(
+            '"content" must be a string or null and "tool_calls" must be an array'
+        )
+    if not calls and not isinstance(content, str):
+        raise ToolOutputError('a normal answer needs a string "content"')
+    if calls and content is not None:
+        raise ToolOutputError('a tool-call reply must set "content" to null')
+    if mode == "none" and calls:
+        raise ToolOutputError("the model called a tool despite tool_choice='none'")
+    if (mode == "required" or mode == "named") and not calls:
+        raise ToolOutputError("the model did not produce the required tool call")
+    if not parallel and len(calls) > 1:
+        raise ToolOutputError(
+            "the model returned multiple calls while parallel_tool_calls is false"
+        )
+
+    converted: List[Dict[str, Any]] = []
+    for call in calls:
+        if (
+            not isinstance(call, dict)
+            or set(call) != CALL_KEYS
+            or not isinstance(call["name"], str)
+            or not isinstance(call["arguments"], dict)
+        ):
+            raise ToolOutputError(
+                'each call must be {"name": "<declared function>", "arguments": {...}}'
+            )
+        name = call["name"]
+        if name not in allowed:
+            raise ToolOutputError(f"the model called an undeclared function {name!r}")
+        if mode == "named" and forced and name != forced:
+            raise ToolOutputError(f"the model called {name!r} instead of {forced!r}")
+        converted.append({
+            "id": f"call_{uuid.uuid4().hex}",
+            "type": "function",
+            "function": {
+                "name": name,
+                "arguments": json.dumps(call["arguments"], ensure_ascii=False),
+            },
+        })
+
+    return ParsedReply(content, converted, text or "")

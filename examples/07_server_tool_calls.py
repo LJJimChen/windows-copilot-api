@@ -1,11 +1,11 @@
 """Example 7 — tool calling through the OpenAI SDK against the server.
 
 Copilot has no native function-calling channel, so the server emulates it: the
-tool schemas are injected into the prompt, the model answers with a bare JSON
+tool schemas are injected into the prompt, the model answers with a routing
 envelope such as
-``{"tool_calls":[{"name":"get_weather","arguments":{"city":"Oslo"}}]}``, and the
-server turns that back into OpenAI ``tool_calls``. From the client's point of
-view this is an ordinary function-calling loop.
+``{"content":null,"tool_calls":[{"name":"get_weather","arguments":{"city":"Oslo"}}]}``,
+and the server turns that back into OpenAI ``tool_calls``. From the client's
+point of view this is an ordinary function-calling loop.
 
 Start the server in another terminal:
 

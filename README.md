@@ -203,9 +203,17 @@ curl http://localhost:8000/v1/chat/completions \
 ### Tool calling (emulated)
 
 Copilot's consumer protocol answers with plain text only — there is no native
-function-calling channel. The server bridges that gap the same way local-model
-stacks do: it injects the tool schemas into the prompt, asks for a fenced
-```tool_call block, and parses it back into OpenAI `tool_calls`:
+function-calling channel. The server bridges that gap by turning tools into a
+*routing* task: the model is told it is not executing anything in the chat, only
+producing a JSON decision that the external application executes. Its reply must
+be exactly one JSON object (no fences, no prose):
+
+```json
+{"content": null, "tool_calls": [{"name": "get_weather", "arguments": {"city": "Oslo"}}]}
+```
+
+A normal answer uses `"tool_calls": []` with a string `"content"`; a tool request
+uses `"content": null`.
 
 ```python
 resp = client.chat.completions.create(
@@ -235,23 +243,20 @@ results back as `role: "tool"` messages and continue.
 The model is told, in the injected instructions, that it has **no filesystem,
 shell, sandbox, canvas or code interpreter** and must not do the work itself —
 so a request like "write index.html" produces a tool call instead of Copilot
-rendering the file in its own cloud container. Its reply must be one bare JSON
-object (no fences, no prose):
+rendering the file in its own cloud container.
 
-```json
-{"tool_calls":[{"name":"get_weather","arguments":{"city":"Oslo"}}]}
-```
+Parsing is strict: a fenced `json` object is tolerated, but anything that is
+not exactly the envelope is a protocol violation. The server retries once with a
+corrective prompt, then returns the raw text as `content` rather than emitting a
+fake call. Guardrails:
 
-The parser also accepts the shapes other open-source stacks produce
-(`<tool_call>`, `[TOOL_CALLS]`, `<|tool_call|>`, DeepSeek blocks, fenced blocks),
-so a model that drifts from the requested format still works. Guardrails:
-
-- calls naming tools that weren't declared are **dropped** and returned as text;
-- `tool_choice: "required"` gets **one** corrective retry;
-- `parallel_tool_calls: false` keeps only the first call;
+- undeclared tools, malformed arguments and fabricated calls are **never
+  forwarded**;
+- `tool_choice: "required"` (or a named tool) gets **one** corrective retry;
+- `parallel_tool_calls: false` rejects a multi-call reply and retries;
 - `tool_choice: "none"` injects no tools at all;
-- streamed tool calls arrive once the turn is complete (arguments are not
-  token-streamed), which every OpenAI-compatible client accepts.
+- streamed tool calls arrive once the whole envelope is validated (arguments are
+  not token-streamed), which every OpenAI-compatible client accepts.
 
 Coding agents such as [pi](https://pi.dev) work through their normal
 OpenAI-compatible provider config — no extra fields needed:

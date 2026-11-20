@@ -1,150 +1,149 @@
-"""Tests for the text -> tool_calls parser (the model's only output channel)."""
+"""Tests for the strict routing-envelope parser.
+
+The parser is the only way a text reply can become an OpenAI ``tool_calls``
+array, so these tests focus on rejecting everything that is not exactly the
+requested envelope.
+"""
 
 import json
 import unittest
 
-from server.tool_parser import first_marker, parse_tool_calls
+from server.tool_parser import ToolOutputError, parse_tool_output
 
 ALLOWED = {"get_weather", "search"}
 
 
-def call(text, allowed=ALLOWED):
-    return parse_tool_calls(text, allowed)
+def parse(text, allowed=ALLOWED, **kw):
+    return parse_tool_output(text, allowed=allowed, **kw)
 
 
-class FormatTests(unittest.TestCase):
+def envelope(content=None, calls=None):
+    return json.dumps({"content": content, "tool_calls": calls or []})
+
+
+class CallTests(unittest.TestCase):
     def assert_call(self, reply, name, arguments):
         self.assertEqual([c["function"]["name"] for c in reply.tool_calls], [name])
         self.assertEqual(json.loads(reply.tool_calls[0]["function"]["arguments"]), arguments)
         self.assertTrue(reply.tool_calls[0]["id"].startswith("call_"))
         self.assertEqual(reply.tool_calls[0]["type"], "function")
 
-    def test_our_fenced_format(self):
-        reply = call('```tool_call\n{"name": "get_weather", "arguments": {"city": "Beijing"}}\n```')
-        self.assertIsNone(reply.content)
-        self.assert_call(reply, "get_weather", {"city": "Beijing"})
-
-    def test_fence_survives_surrounding_prose(self):
-        reply = call(
-            "I'll check that.\n```tool_call\n"
-            '{"name": "get_weather", "arguments": {"city": "Beijing"}}\n```'
-        )
-        self.assertEqual(reply.content, "I'll check that.")
-        self.assert_call(reply, "get_weather", {"city": "Beijing"})
-
-    def test_hermes_xml(self):
-        reply = call('<tool_call>{"name":"get_weather","arguments":{"city":"Oslo"}}</tool_call>')
+    def test_valid_call_envelope(self):
+        reply = parse(envelope(calls=[{"name": "get_weather", "arguments": {"city": "Oslo"}}]))
         self.assertIsNone(reply.content)
         self.assert_call(reply, "get_weather", {"city": "Oslo"})
 
-    def test_mistral_marker(self):
-        reply = call('[TOOL_CALLS] [{"name":"get_weather","arguments":{"city":"Oslo"}}]')
-        self.assert_call(reply, "get_weather", {"city": "Oslo"})
+    def test_fenced_json_is_tolerated(self):
+        raw = "```json\n" + envelope(
+            calls=[{"name": "get_weather", "arguments": {"city": "Oslo"}}]
+        ) + "\n```"
+        self.assert_call(parse(raw), "get_weather", {"city": "Oslo"})
 
-    def test_llama_marker(self):
-        reply = call('<|tool_call|>{"name":"get_weather","arguments":{"city":"Oslo"}}')
-        self.assert_call(reply, "get_weather", {"city": "Oslo"})
-
-    def test_deepseek_block(self):
-        reply = call(
-            "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>get_weather\n"
-            '```json\n{"city":"Oslo"}\n```<｜end_of_query｜><｜end_of_query｜>'
-        )
-        self.assertIsNone(reply.content)
-        self.assert_call(reply, "get_weather", {"city": "Oslo"})
-
-    def test_bare_json_without_fence(self):
-        reply = call('{"name": "get_weather", "arguments": {"city": "Oslo"}}')
-        self.assert_call(reply, "get_weather", {"city": "Oslo"})
-
-    def test_llama_style_parameters_key(self):
-        reply = call('{"name":"get_weather","parameters":{"city":"Oslo"}}')
-        self.assert_call(reply, "get_weather", {"city": "Oslo"})
-
-    def test_openai_style_tool_calls_wrapper(self):
-        reply = call(
-            '{"tool_calls":[{"type":"function","function":'
-            '{"name":"search","arguments":"{\\"q\\": \\"rust\\"}"}}]}'
-        )
-        self.assert_call(reply, "search", {"q": "rust"})
-
-    def test_json_envelope_with_parallel_calls(self):
-        reply = call(
-            '{"tool_calls":['
-            '{"name":"get_weather","arguments":{"city":"Oslo"}},'
-            '{"name":"search","arguments":{"q":"oslo"}}]}'
-        )
-        self.assertEqual(
-            [c["function"]["name"] for c in reply.tool_calls], ["get_weather", "search"]
-        )
+    def test_empty_arguments_object(self):
+        reply = parse(envelope(calls=[{"name": "search", "arguments": {}}]))
+        self.assert_call(reply, "search", {})
 
     def test_parallel_calls(self):
-        reply = call(
-            "```tool_call\n"
-            '{"name":"get_weather","arguments":{"city":"Oslo"}}\n'
-            "```\n```tool_call\n"
-            '{"name":"search","arguments":{"q":"weather"}}\n'
-            "```"
-        )
+        reply = parse(envelope(calls=[
+            {"name": "get_weather", "arguments": {"city": "Oslo"}},
+            {"name": "search", "arguments": {"q": "oslo"}},
+        ]))
         self.assertEqual(
             [c["function"]["name"] for c in reply.tool_calls], ["get_weather", "search"]
         )
+        self.assertNotEqual(reply.tool_calls[0]["id"], reply.tool_calls[1]["id"])
 
-
-class ValidationTests(unittest.TestCase):
-    def test_unknown_tool_is_left_as_text(self):
-        raw = '```tool_call\n{"name":"drop_database","arguments":{}}\n```'
-        reply = call(raw)
-        self.assertEqual(reply.tool_calls, [])
-        self.assertIn("drop_database", reply.content)
-
-    def test_invalid_json_is_left_as_text(self):
-        raw = "```tool_call\n{not json at all}\n```"
-        reply = call(raw)
-        self.assertEqual(reply.tool_calls, [])
-        self.assertIn("not json at all", reply.content)
-
-    def test_non_dict_arguments_are_rejected(self):
-        reply = call('```tool_call\n{"name":"get_weather","arguments":"Oslo"}\n```')
-        self.assertEqual(reply.tool_calls, [])
-
-    def test_no_call_returns_original_text(self):
-        reply = call("Just a normal answer, with {braces} in it.")
-        self.assertEqual(reply.tool_calls, [])
-        self.assertEqual(reply.content, "Just a normal answer, with {braces} in it.")
-
-    def test_unbalanced_prose_brace_does_not_hide_a_later_call(self):
-        reply = call('A { stray brace.\n{"name":"get_weather","arguments":{"city":"Oslo"}}')
-        self.assertEqual(len(reply.tool_calls), 1)
-        self.assertEqual(json.loads(reply.tool_calls[0]["function"]["arguments"]), {"city": "Oslo"})
-
-    def test_truncated_json_does_not_crash(self):
-        reply = call('```tool_call\n{"name":"get_weather","arguments":{"city":"Os')
-        self.assertEqual(reply.tool_calls, [])
-
-    def test_braces_inside_arguments_do_not_end_the_call(self):
-        reply = call(
-            '```tool_call\n{"name":"search","arguments":{"q":"a } b { c"}}\n```'
+    def test_braces_inside_arguments_are_preserved(self):
+        arguments = {"q": "a } b { c"}
+        reply = parse(envelope(calls=[{"name": "search", "arguments": arguments}]))
+        self.assertEqual(
+            json.loads(reply.tool_calls[0]["function"]["arguments"]), arguments
         )
-        self.assert_call_arguments(reply, {"q": "a } b { c"})
-
-    def assert_call_arguments(self, reply, expected):
-        self.assertEqual(json.loads(reply.tool_calls[0]["function"]["arguments"]), expected)
 
 
-class StreamingMarkerTests(unittest.TestCase):
-    def test_detects_every_opener(self):
-        for opener in (
-            '{"tool_calls"',
-            "```tool_call",
-            "<tool_call>",
-            "[TOOL_CALLS]",
-            "<|tool_call|>",
-        ):
-            self.assertEqual(first_marker("hello " + opener), 6, opener)
+class AnswerTests(unittest.TestCase):
+    def test_normal_answer(self):
+        reply = parse(envelope(content="Beijing is warm today."))
+        self.assertEqual(reply.content, "Beijing is warm today.")
+        self.assertEqual(reply.tool_calls, [])
 
-    def test_plain_text_has_no_marker(self):
-        self.assertIsNone(first_marker("a normal ```python code block"))
+    def test_empty_answer_string_is_allowed(self):
+        reply = parse(envelope(content=""))
+        self.assertEqual(reply.content, "")
+        self.assertEqual(reply.tool_calls, [])
+
+
+class StrictnessTests(unittest.TestCase):
+    def assert_invalid(self, raw, **kw):
+        with self.assertRaises(ToolOutputError):
+            parse(raw, **kw)
+
+    def test_invalid_json(self):
+        self.assert_invalid("{not json at all}")
+
+    def test_plain_prose_is_not_json(self):
+        self.assert_invalid("Beijing is warm today.")
+
+    def test_legacy_fenced_tool_call_is_rejected(self):
+        self.assert_invalid(
+            '```tool_call\n{"name":"get_weather","arguments":{"city":"Oslo"}}\n```'
+        )
+
+    def test_extra_envelope_key(self):
+        self.assert_invalid(
+            '{"content":null,"tool_calls":[],"extra":1}'
+        )
+
+    def test_missing_content_key(self):
+        self.assert_invalid('{"tool_calls":[]}')
+
+    def test_duplicate_json_key(self):
+        self.assert_invalid('{"content":"a","content":"b","tool_calls":[]}')
+
+    def test_nan_constant(self):
+        self.assert_invalid('{"content":NaN,"tool_calls":[]}')
+
+    def test_normal_answer_needs_string_content(self):
+        self.assert_invalid('{"content":null,"tool_calls":[]}')
+
+    def test_tool_call_must_null_content(self):
+        self.assert_invalid(envelope(content="ok", calls=[
+            {"name": "get_weather", "arguments": {"city": "Oslo"}}
+        ]))
+
+    def test_unknown_tool(self):
+        self.assert_invalid(envelope(calls=[{"name": "rm_rf", "arguments": {}}]))
+
+    def test_arguments_must_be_an_object(self):
+        self.assert_invalid(envelope(calls=[{"name": "get_weather", "arguments": "Oslo"}]))
+
+    def test_call_must_have_exactly_name_and_arguments(self):
+        self.assert_invalid(envelope(calls=[
+            {"name": "get_weather", "arguments": {}, "extra": 1}
+        ]))
+
+    def test_required_mode_without_call(self):
+        self.assert_invalid(envelope(content="just prose"), mode="required")
+
+    def test_named_mode_rejects_another_tool(self):
+        self.assert_invalid(
+            envelope(calls=[{"name": "search", "arguments": {"q": "x"}}]),
+            mode="named",
+            forced="get_weather",
+        )
+
+    def test_parallel_disabled_rejects_two_calls(self):
+        self.assert_invalid(envelope(calls=[
+            {"name": "get_weather", "arguments": {"city": "Oslo"}},
+            {"name": "search", "arguments": {"q": "oslo"}},
+        ]), parallel=False)
+
+    def test_parallel_disabled_accepts_one_call(self):
+        reply = parse(
+            envelope(calls=[{"name": "get_weather", "arguments": {"city": "Oslo"}}]),
+            parallel=False,
+        )
+        self.assertEqual(len(reply.tool_calls), 1)
 
 
 if __name__ == "__main__":

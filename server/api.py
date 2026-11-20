@@ -14,7 +14,7 @@ Two emulation layers live here:
 import threading
 import time
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -34,7 +34,7 @@ from .prompt import continuation_prompt, messages_to_prompt
 from .ratelimit import TokenBucket
 from .schemas import ChatCompletionRequest
 from .sessions import ConversationStore, history_fingerprints
-from .tool_parser import first_marker, parse_tool_calls
+from .tool_parser import ToolOutputError, parse_tool_output
 from .tool_prompt import ToolContext, build_tool_context
 
 app = FastAPI(title="Copilot OpenAI-compatible API", version="1.1.0")
@@ -42,11 +42,6 @@ app = FastAPI(title="Copilot OpenAI-compatible API", version="1.1.0")
 # are plain HTTP, and if the session is gone entirely the request fails with a
 # message to run `python -m copilot login` out of band.
 client = CopilotClient(interactive_clear=False)
-
-# How many trailing characters the streaming tool-call sniffer withholds before
-# flushing text to the client. Must exceed the longest tool-call opener so a
-# marker split across chunks is never emitted as content.
-TOOL_HOLD = 32
 
 # history fingerprint -> upstream conversation, in memory (see server/sessions.py).
 _sessions = ConversationStore()
@@ -105,6 +100,14 @@ class _Prepared:
     fingerprints: Tuple[str, ...]
 
 
+@dataclass
+class _Reply:
+    """The pieces of an upstream reply we need after a streamed turn."""
+
+    text: str
+    conversation_id: Optional[str] = None
+
+
 def _prepare(req: ChatCompletionRequest) -> _Prepared:
     """Resolve the upstream thread and render only the part Copilot hasn't seen."""
     fingerprints = history_fingerprints(req.messages)
@@ -114,7 +117,7 @@ def _prepare(req: ChatCompletionRequest) -> _Prepared:
     if state is not None:
         if ctx is None:
             # The client stopped declaring tools: tell the thread, otherwise it
-            # may keep emitting tool_call blocks we no longer parse.
+            # may keep emitting routing envelopes we no longer parse.
             system = (
                 "Tool calling is no longer available. Answer in plain text."
                 if state.tool_sig else None
@@ -152,30 +155,53 @@ def _remember(prepared: _Prepared, conversation_id: Optional[str]) -> None:
     )
 
 
-def _limit_calls(calls: List[dict], ctx: Optional[ToolContext]) -> List[dict]:
-    if ctx is not None and not ctx.parallel:
-        return calls[:1]
-    return calls
+def _parse(ctx: ToolContext, text: str):
+    return parse_tool_output(
+        text,
+        allowed=ctx.allowed,
+        mode=ctx.mode,
+        forced=ctx.forced,
+        parallel=ctx.parallel,
+    )
+
+
+def _tool_reply(ctx: ToolContext, reply: Any) -> Tuple[Any, Optional[str], List[dict]]:
+    """Validate a tool-enabled reply; retry once when it breaks the protocol.
+
+    The retry reuses the same Copilot thread, so the model sees its own invalid
+    answer and the corrective instruction. If it still refuses to answer with a
+    routing envelope, the raw text is returned as content rather than failing
+    the whole request.
+    """
+    try:
+        parsed = _parse(ctx, reply.text)
+        return reply, parsed.content, parsed.tool_calls
+    except ToolOutputError as exc:
+        reason = str(exc)
+
+    retry = client.chat(ctx.retry_prompt(reason), conversation_id=reply.conversation_id)
+    try:
+        parsed = _parse(ctx, retry.text)
+        return retry, parsed.content, parsed.tool_calls
+    except ToolOutputError:
+        return retry, retry.text, []
 
 
 def _complete(prepared: _Prepared, model: str) -> Tuple[dict, Optional[str]]:
-    """Non-streaming turn: run the upstream chat, optionally parse tool calls."""
+    """Non-streaming turn: run the upstream chat and parse the routing decision."""
     ctx = prepared.tools
     reply = client.chat(prepared.prompt, conversation_id=prepared.conversation_id)
-    content, calls = reply.text, []
-    if ctx is not None:
-        parsed = parse_tool_calls(reply.text, ctx.allowed)
-        content, calls = parsed.content, parsed.tool_calls
-        if ctx.mode == "required" and not calls and reply.conversation_id:
-            # tool_choice demanded a call but the model answered in prose. One
-            # corrective turn on the same thread; if it still refuses we return
-            # the text rather than failing the request.
-            retry = client.chat(ctx.retry_prompt(), conversation_id=reply.conversation_id)
-            parsed = parse_tool_calls(retry.text, ctx.allowed)
-            content, calls = parsed.content, parsed.tool_calls
-            reply = retry
-        calls = _limit_calls(calls, ctx)
-    return completion_response(content, model, reply.conversation_id, calls), reply.conversation_id
+    if ctx is None:
+        return (
+            completion_response(reply.text, model, reply.conversation_id),
+            reply.conversation_id,
+        )
+
+    reply, content, calls = _tool_reply(ctx, reply)
+    return (
+        completion_response(content, model, reply.conversation_id, calls),
+        reply.conversation_id,
+    )
 
 
 def _stream(prepared: _Prepared, model: str):
@@ -201,61 +227,18 @@ def _stream(prepared: _Prepared, model: str):
                             stream_chunk(cid, created, model, {"content": piece})
                         )
 
-            elif ctx.mode == "required":
-                # A call is mandatory, so nothing useful can be streamed until
-                # we know whether the model complied. Buffer the whole turn.
-                text = "".join(piece for piece in stream if isinstance(piece, str))
-                parsed = parse_tool_calls(text, ctx.allowed)
-                calls = parsed.tool_calls
-                if not calls and stream.conversation_id:
-                    retry = client.chat(
-                        ctx.retry_prompt(), conversation_id=stream.conversation_id
-                    )
-                    parsed = parse_tool_calls(retry.text, ctx.allowed)
-                    calls = parsed.tool_calls
-                if parsed.content:
-                    yield sse_event(
-                        stream_chunk(cid, created, model, {"content": parsed.content})
-                    )
-                calls = _limit_calls(calls, ctx)
-
             else:
-                # auto mode: stream text immediately, but withhold a small tail
-                # so an opener split across chunks is detected before leaking.
-                buffer = ""
-                tool_mode = False
-                for piece in stream:
-                    if not isinstance(piece, str) or not piece:
-                        continue
-                    buffer += piece
-                    if tool_mode:
-                        continue
-                    hit = first_marker(buffer)
-                    if hit is not None:
-                        if hit > 0:
-                            yield sse_event(
-                                stream_chunk(cid, created, model, {"content": buffer[:hit]})
-                            )
-                        buffer = buffer[hit:]
-                        tool_mode = True
-                    elif len(buffer) > TOOL_HOLD:
-                        flush = buffer[:-TOOL_HOLD]
-                        buffer = buffer[-TOOL_HOLD:]
-                        yield sse_event(
-                            stream_chunk(cid, created, model, {"content": flush})
-                        )
-                if tool_mode:
-                    parsed = parse_tool_calls(buffer, ctx.allowed)
-                    if parsed.content:
-                        yield sse_event(
-                            stream_chunk(cid, created, model, {"content": parsed.content})
-                        )
-                    calls = parsed.tool_calls
-                elif buffer:
+                # The reply is one JSON envelope, so it is only useful once the
+                # whole turn has arrived: buffer, then validate/retry/emit.
+                text = "".join(piece for piece in stream if isinstance(piece, str))
+                reply, content, calls = _tool_reply(
+                    ctx, _Reply(text, stream.conversation_id)
+                )
+                if content:
                     yield sse_event(
-                        stream_chunk(cid, created, model, {"content": buffer})
+                        stream_chunk(cid, created, model, {"content": content})
                     )
-                calls = _limit_calls(calls, ctx)
+                conversation_id = reply.conversation_id or conversation_id
 
             conversation_id = stream.conversation_id or conversation_id
             _remember(prepared, conversation_id)
