@@ -110,6 +110,24 @@ The browser **closes by itself** once sign-in is detected — you don't need to 
 
 ---
 
+## Configuration
+
+All settings live in `.env` at the project root and are loaded automatically
+with [python-dotenv](https://github.com/theskumar/python-dotenv). Copy the
+template once and edit it:
+
+```bash
+cp .env.example .env
+```
+
+Real environment variables override the file, so
+`LOG_PROMPT=1 python app.py` still works for a one-off run. The file covers the
+server (`HOST`, `PORT`, rate limits, conversation cache, `LOG_PROMPT`), the
+account profile (`COPILOT_PROFILE`) and optional Copilot overrides. The tables
+throughout this README document each variable.
+
+---
+
 ## Run with Docker (optional)
 
 Prefer a container? You can run the OpenAI-compatible server in Docker once you've signed in.
@@ -300,6 +318,20 @@ That cache is in memory, per process, and bounded:
 The explicit `conversation_id` field still works and is used when no history
 match is found; on the first turn with it the whole history is resent (legacy
 behaviour).
+
+### Prompt debugging
+
+A long prompt can *look* truncated in Copilot's web UI even when the bridge sent
+all of it. Set `LOG_PROMPT=1` to print the exact payload, its size and target
+conversation to stderr right before every upstream send (including corrective
+retries):
+
+```bash
+LOG_PROMPT=1 python app.py
+```
+
+The log is framed with `[copilot] prompt -> ...` / `[copilot] end prompt` so it
+is easy to capture and grep. It only prints; the prompt is sent unchanged.
 
 
 ---

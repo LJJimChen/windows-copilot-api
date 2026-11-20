@@ -1,6 +1,13 @@
 """Server configuration — shared constants."""
 
 import os
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+# `.env` in the project root is loaded on import. Real environment variables win
+# over the file, and a missing file is fine.
+load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 # The single model id this bridge advertises (Copilot has no model selector).
 MODEL_NAME = "copilot"
@@ -25,3 +32,11 @@ RATE_LIMIT_BURST = int(os.environ.get("RATE_LIMIT_BURST", "4"))
 SESSION_TTL = float(os.environ.get("SESSION_TTL", "1800"))
 SESSION_MAX = int(os.environ.get("SESSION_MAX", "64"))
 SESSION_REGENERATE_WINDOW = float(os.environ.get("SESSION_REGENERATE_WINDOW", "300"))
+
+# Prompt diagnostics. A long prompt can *look* cut off in Copilot's web UI even
+# though the whole string was sent, so LOG_PROMPT prints the exact payload (and
+# its size) right before each upstream send.
+#   LOG_PROMPT  1/true/yes/on prints every prompt to stderr.
+LOG_PROMPT = os.environ.get("LOG_PROMPT", "").strip().lower() in (
+    "1", "true", "yes", "on"
+)

@@ -108,7 +108,7 @@ class ToolContext:
             '- Wrong: a ```html block, an artifact, or "I created hello.html" '
             "instead of the JSON object.\n\n"
             "<available_tools>\n"
-            f"{json.dumps(specs, ensure_ascii=False, indent=2)}\n"
+            f"{json.dumps(specs, ensure_ascii=False, separators=(',', ':'))}\n"
             "</available_tools>"
         )
 

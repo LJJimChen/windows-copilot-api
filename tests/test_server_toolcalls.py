@@ -3,8 +3,10 @@
 The Copilot client is faked, so these run without a signed-in account.
 """
 
+import io
 import json
 import unittest
+from contextlib import redirect_stderr
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -237,6 +239,18 @@ class ToolCallApiTests(unittest.TestCase):
         self.assertEqual(choice["finish_reason"], "stop")
         self.assertEqual(choice["message"]["content"], "Still just prose.")
         self.assertEqual(len(self.fake.chat_calls), 2)
+
+    def test_prompt_can_be_logged(self):
+        self.fake.replies = [ANSWER]
+        stderr = io.StringIO()
+        with patch.object(server_api, "LOG_PROMPT", True), redirect_stderr(stderr):
+            self.post([{"role": "user", "content": "hi"}])
+
+        logged = stderr.getvalue()
+        self.assertIn("[copilot] prompt ->", logged)
+        self.assertIn("chars=", logged)
+        self.assertIn("get_weather", logged)
+        self.assertIn("[copilot] end prompt", logged)
 
 
 class StreamingToolCallTests(unittest.TestCase):

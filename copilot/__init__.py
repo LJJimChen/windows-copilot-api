@@ -14,6 +14,14 @@ Basic usage — one client, conversations addressed by id:
 
 __version__ = '1.0.0'
 
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+# Load `.env` from the project root for the CLI and library use too. The server
+# does the same in :mod:`server.config`; loading twice is harmless.
+load_dotenv(Path(__file__).resolve().parent.parent / ".env")
+
 from .auth import load_auth
 from .browser import BrowserCopilot
 from .client import ChatReply, CopilotClient

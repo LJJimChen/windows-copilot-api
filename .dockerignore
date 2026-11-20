@@ -5,6 +5,7 @@ __pycache__/
 *.py[cod]
 docs/
 config.json
+.env
 test.py
 main.py
 # Keep session secrets (cookies + token) out of the built image. Compose

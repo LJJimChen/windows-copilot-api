@@ -11,6 +11,7 @@ Two emulation layers live here:
   ``tool_calls`` (:mod:`server.tool_parser`).
 """
 
+import sys
 import threading
 import time
 from dataclasses import dataclass
@@ -22,7 +23,12 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from copilot import CopilotClient
 from copilot.driver import ClearanceRequired, LicenseRequired
 
-from .config import MODEL_NAME, RATE_LIMIT_BURST, RATE_LIMIT_RPM
+from .config import (
+    LOG_PROMPT,
+    MODEL_NAME,
+    RATE_LIMIT_BURST,
+    RATE_LIMIT_RPM,
+)
 from .openai_format import (
     completion_response,
     new_id,
@@ -108,6 +114,31 @@ class _Reply:
     conversation_id: Optional[str] = None
 
 
+def _log_prompt(prompt: str, conversation_id: Optional[str]) -> None:
+    """Print the exact upstream payload when ``LOG_PROMPT`` is enabled."""
+    if not LOG_PROMPT:
+        return
+    target = conversation_id or "new"
+    print(
+        f"\n[copilot] prompt -> conversation={target} chars={len(prompt)} "
+        f"bytes={len(prompt.encode('utf-8'))}\n"
+        f"{prompt}\n"
+        "[copilot] end prompt\n",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
+def _send_chat(prompt: str, conversation_id: Optional[str] = None):
+    _log_prompt(prompt, conversation_id)
+    return client.chat(prompt, conversation_id=conversation_id)
+
+
+def _send_stream(prompt: str, conversation_id: Optional[str] = None):
+    _log_prompt(prompt, conversation_id)
+    return client.stream(prompt, conversation_id=conversation_id)
+
+
 def _prepare(req: ChatCompletionRequest) -> _Prepared:
     """Resolve the upstream thread and render only the part Copilot hasn't seen."""
     fingerprints = history_fingerprints(req.messages)
@@ -179,7 +210,7 @@ def _tool_reply(ctx: ToolContext, reply: Any) -> Tuple[Any, Optional[str], List[
     except ToolOutputError as exc:
         reason = str(exc)
 
-    retry = client.chat(ctx.retry_prompt(reason), conversation_id=reply.conversation_id)
+    retry = _send_chat(ctx.retry_prompt(reason), reply.conversation_id)
     try:
         parsed = _parse(ctx, retry.text)
         return retry, parsed.content, parsed.tool_calls
@@ -190,7 +221,7 @@ def _tool_reply(ctx: ToolContext, reply: Any) -> Tuple[Any, Optional[str], List[
 def _complete(prepared: _Prepared, model: str) -> Tuple[dict, Optional[str]]:
     """Non-streaming turn: run the upstream chat and parse the routing decision."""
     ctx = prepared.tools
-    reply = client.chat(prepared.prompt, conversation_id=prepared.conversation_id)
+    reply = _send_chat(prepared.prompt, prepared.conversation_id)
     if ctx is None:
         return (
             completion_response(reply.text, model, reply.conversation_id),
@@ -215,8 +246,8 @@ def _stream(prepared: _Prepared, model: str):
     try:
         with _upstream_lock:  # one upstream chat at a time (released on disconnect)
             yield sse_event(stream_chunk(cid, created, model, {"role": "assistant"}))
-            stream = client.stream(
-                prepared.prompt, conversation_id=prepared.conversation_id
+            stream = _send_stream(
+                prepared.prompt, prepared.conversation_id
             )
 
             if ctx is None:
